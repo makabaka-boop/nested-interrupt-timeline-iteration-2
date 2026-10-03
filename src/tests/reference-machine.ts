@@ -6,7 +6,7 @@
  * 逐 tick 比较归一化后的完整状态快照；再加上手写期望序列核对具体场景。
  */
 
-import { LineConfig, PendingInfo, ScheduledEvent, TickRecord } from '../model.js';
+import { BlockedInfo, LineConfig, PendingInfo, ScheduledEvent, ThresholdSource, TickRecord } from '../model.js';
 
 interface RefFrame {
   lineId: string;
@@ -26,6 +26,9 @@ interface RefSnapshot {
   levelAsserted: string[];
   masked: string[];
   topRemaining: number | null;
+  effectiveThreshold: number | null;
+  thresholdSources: ThresholdSource[];
+  blocked: BlockedInfo[];
 }
 
 export class ReferenceMachine {
@@ -74,6 +77,26 @@ export class ReferenceMachine {
           ? -1
           : 1
       );
+  }
+
+  /** 有效门槛：栈上所有帧已执行拍数落在 [from,to) 内的区间的最高门槛。 */
+  private ceiling(): { th: number | null; src: ThresholdSource[] } {
+    let th: number | null = null;
+    const src: ThresholdSource[] = [];
+    for (const f of this.stack) {
+      for (const c of this.cfg.get(f.lineId)!.criticalSections ?? []) {
+        if (f.elapsed >= c.from && f.elapsed < c.to) {
+          if (th === null || c.threshold > th) {
+            th = c.threshold;
+            src.length = 0;
+            src.push({ lineId: f.lineId, from: c.from, to: c.to, threshold: c.threshold });
+          } else if (c.threshold === th) {
+            src.push({ lineId: f.lineId, from: c.from, to: c.to, threshold: c.threshold });
+          }
+        }
+      }
+    }
+    return { th, src };
   }
 
   /** 只推进一个 tick；结束后返回 null。 */
@@ -165,6 +188,8 @@ export class ReferenceMachine {
     const runnable = this.orderedRunnable();
     const win = runnable[0];
     const cur = this.stack[this.stack.length - 1];
+    const ceil = this.ceiling();
+    const blocked: BlockedInfo[] = [];
     let action: TickRecord['action'];
     if (!cur) {
       if (win) {
@@ -174,17 +199,31 @@ export class ReferenceMachine {
         this.running.add(win.lineId);
         action = { type: 'enter', lineId: win.lineId };
       } else action = { type: 'idle' };
-    } else if (win && this.pri(win.lineId) > this.pri(cur.lineId)) {
-      cur.preempted = true;
-      const target = this.pending.find((p2) => p2.lineId === win.lineId)!;
-      this.pending.splice(this.pending.indexOf(target), 1);
-      this.stack.push({ lineId: win.lineId, total: this.cfg.get(win.lineId)!.handlerTicks, elapsed: 0, enteredAt: tick, preempted: false });
-      this.running.add(win.lineId);
-      action = { type: 'preempt', by: win.lineId, resumed: cur.lineId };
-    } else if (cur.preempted) {
-      action = { type: 'resume', lineId: cur.lineId };
     } else {
-      action = { type: 'continue', lineId: cur.lineId };
+      const topPri = this.pri(cur.lineId);
+      const winPri = win ? this.pri(win.lineId) : null;
+      const denied = win !== undefined && winPri! > topPri && ceil.th !== null && winPri! <= ceil.th;
+      if (win && winPri! > topPri && !denied) {
+        cur.preempted = true;
+        const target = this.pending.find((p2) => p2.lineId === win.lineId)!;
+        this.pending.splice(this.pending.indexOf(target), 1);
+        this.stack.push({ lineId: win.lineId, total: this.cfg.get(win.lineId)!.handlerTicks, elapsed: 0, enteredAt: tick, preempted: false });
+        this.running.add(win.lineId);
+        action = { type: 'preempt', by: win.lineId, resumed: cur.lineId };
+      } else {
+        if (denied) {
+          // 被门槛挡住：待处理位不动，只记录证据。
+          for (const p of runnable) {
+            const pp = this.pri(p.lineId);
+            if (pp > topPri) blocked.push({ lineId: p.lineId, priority: pp, topPriority: topPri, threshold: ceil.th! });
+          }
+        }
+        if (cur.preempted) {
+          action = { type: 'resume', lineId: cur.lineId };
+        } else {
+          action = { type: 'continue', lineId: cur.lineId };
+        }
+      }
     }
 
     // ---- 阶段 D：执行 1 tick ----
@@ -206,6 +245,9 @@ export class ReferenceMachine {
       levelAsserted: [...this.level].sort(),
       masked: [...this.masked].sort(),
       topRemaining: exec ? exec.total - exec.elapsed : null,
+      effectiveThreshold: ceil.th,
+      thresholdSources: ceil.src,
+      blocked,
     };
   }
 }

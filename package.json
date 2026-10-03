@@ -5,7 +5,7 @@
   "scripts": {
     "build": "tsc -p tsconfig.json && esbuild src/main.ts --bundle --format=esm --outfile=dist/main.js",
     "build:tests": "tsc -p tsconfig.tests.json",
-    "test": "tsx src/tests/run-tests.ts",
+    "test": "vitest run",
     "typecheck": "tsc -p tsconfig.json",
     "serve": "node serve.mjs"
   },
@@ -17,7 +17,8 @@
     "@types/node": "^26.6.3",
     "esbuild": "^0.28.2",
     "tsx": "^4.23.15",
-    "typescript": "^5.9.3"
+    "typescript": "^5.9.3",
+    "vitest": "^4.1.11"
   },
   "type": "module"
 }

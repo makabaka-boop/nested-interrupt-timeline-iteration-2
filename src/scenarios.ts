@@ -1,6 +1,6 @@
 /** 页面预置演示配置与事件。 */
 
-import { LineConfig, ScheduledEvent } from './model';
+import { LineConfig, ScheduledEvent } from './model.js';
 
 export interface Demo {
   name: string;
@@ -80,6 +80,41 @@ export const DEMOS: Demo[] = [
       { at: 3, lineId: 'A', kind: 'setPriority', priority: 1 },
       { at: 4, lineId: 'E', kind: 'setMode', mode: 'level' },
       { at: 4, lineId: 'E', kind: 'unmask' },
+    ],
+  },
+  {
+    name: '临界区间：共享寄存器保护',
+    description:
+      'D 写共享寄存器的第 2～4 执行拍是临界区（门槛 8）：M(p5) 被挡，Q(p8) 等于门槛也不算严格更高仍被挡，' +
+      '只有真正紧急的 U(p9) 能进入；U 完成后 D 的临界区继续生效，退出后 Q、M 才按优先级依次抢占。',
+    lines: [
+      { id: 'D', priority: 2, mode: 'edge', handlerTicks: 5, criticalSections: [{ from: 1, to: 4, threshold: 8 }] },
+      { id: 'M', priority: 5, mode: 'edge', handlerTicks: 1 },
+      { id: 'Q', priority: 8, mode: 'edge', handlerTicks: 1 },
+      { id: 'U', priority: 9, mode: 'edge', handlerTicks: 1 },
+    ],
+    events: [
+      { at: 1, lineId: 'D', kind: 'raise' },
+      { at: 2, lineId: 'M', kind: 'raise' },
+      { at: 2, lineId: 'Q', kind: 'raise' },
+      { at: 4, lineId: 'U', kind: 'raise' },
+    ],
+  },
+  {
+    name: '临界区间：跨帧门槛 + 当拍调级',
+    description:
+      'G 的临界区（门槛 7）被 H(p9) 抢占后仍然生效；H 在 tick3 被调低到 3 后，C(p5) 虽高于栈顶，' +
+      '却未严格高于 G 悬挂帧的门槛而被挡，直到 G 恢复并走出临界区才获准抢占。',
+    lines: [
+      { id: 'G', priority: 1, mode: 'edge', handlerTicks: 5, criticalSections: [{ from: 1, to: 4, threshold: 7 }] },
+      { id: 'H', priority: 9, mode: 'edge', handlerTicks: 3 },
+      { id: 'C', priority: 5, mode: 'edge', handlerTicks: 1 },
+    ],
+    events: [
+      { at: 1, lineId: 'G', kind: 'raise' },
+      { at: 2, lineId: 'H', kind: 'raise' },
+      { at: 3, lineId: 'H', kind: 'setPriority', priority: 3 },
+      { at: 3, lineId: 'C', kind: 'raise' },
     ],
   },
 ];

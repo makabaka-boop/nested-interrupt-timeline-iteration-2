@@ -26,6 +26,7 @@ const els = {
   chips: $<HTMLDivElement>('#chips'),
   tickNo: $<HTMLSpanElement>('#tickNo'),
   remaining: $<HTMLSpanElement>('#remaining'),
+  threshold: $<HTMLSpanElement>('#threshold'),
   stackView: $<HTMLDivElement>('#stackView'),
   pendingBox: $<HTMLDivElement>('#pendingBox'),
   levelBox: $<HTMLDivElement>('#levelBox'),
@@ -154,9 +155,12 @@ function renderChips(): void {
   for (const l of config.lines) {
     const c = document.createElement('span');
     c.className = 'chip';
+    const cs = (l.criticalSections ?? [])
+      .map((s) => `临界[${s.from},${s.to})≥${s.threshold}`)
+      .join(' ');
     c.innerHTML = `<b style="color:${lineColor(l.id)}">${l.id}</b> · p${l.priority} · ${
       l.mode === 'edge' ? '边沿' : '电平'
-    } · ${l.handlerTicks}t${l.initiallyMasked ? ' · 已屏蔽' : ''}`;
+    } · ${l.handlerTicks}t${l.initiallyMasked ? ' · 已屏蔽' : ''}${cs ? ` · ${cs}` : ''}`;
     els.chips.appendChild(c);
   }
 }
@@ -176,9 +180,15 @@ function renderState(rec: TickRecord | null): void {
     els.levelBox.innerHTML = '<span class="hint">—</span>';
     els.maskBox.innerHTML = '<span class="hint">—</span>';
     els.remaining.textContent = '—';
+    els.threshold.textContent = '—';
     return;
   }
   els.remaining.textContent = rec.topRemaining === null ? '空闲' : `${rec.topRemaining} tick`;
+  // 有效门槛：与轨迹记录、时间轴、日志中的值同源（阶段 C 裁决所用）。
+  els.threshold.textContent =
+    rec.effectiveThreshold === null
+      ? '无'
+      : `${rec.effectiveThreshold}（${rec.thresholdSources.map((s) => `${s.lineId}[${s.from},${s.to})`).join('、')}）`;
 
   // 执行栈（自底向上）
   els.stackView.innerHTML = '';
@@ -189,6 +199,8 @@ function renderState(rec: TickRecord | null): void {
     const cfg = config!.lines.find((l) => l.id === f.lineId)!;
     const top = i === rec.stack.length - 1;
     const pct = Math.round((f.elapsed / f.total) * 100);
+    // 本 tick 阶段 C 为该帧计算的生效临界区间（与有效门槛同源）。
+    const locks = rec.thresholdSources.filter((s) => s.lineId === f.lineId);
     const div = document.createElement('div');
     div.className = 'frame' + (top ? ' top' : '');
     div.style.borderLeftColor = lineColor(f.lineId);
@@ -196,6 +208,7 @@ function renderState(rec: TickRecord | null): void {
       <div style="flex:1">
         <b style="color:${lineColor(f.lineId)}">${f.lineId}</b>
         <span class="mono2"> p${cfg.priority} · ${cfg.mode === 'edge' ? '边沿' : '电平'}</span>
+        ${locks.map((s) => `<span class="lock">🔒临界[${s.from},${s.to})≥${s.threshold}</span>`).join('')}
         <div class="bar"><i style="width:${pct}%;background:${lineColor(f.lineId)}"></i></div>
       </div>
       <div class="mono2" style="white-space:nowrap">${f.elapsed}/${f.total} tick</div>`;
@@ -266,6 +279,26 @@ function renderTimeline(): void {
   }
   html += '</tr>';
 
+  // 有效门槛行（与逐 tick 表格、日志引用同一轨迹的同一数值）
+  html += '<tr><td style="position:sticky;left:0;background:var(--panel);font-size:10px;color:var(--muted)">有效门槛</td>';
+  for (let t = 1; t <= last; t++) {
+    const r = ticks[t - 1];
+    const sel = selectedTick === t ? ' selected' : '';
+    const th = r?.effectiveThreshold;
+    const blockedHere = r && r.blocked.length > 0;
+    const title = r
+      ? th === null
+        ? `t${t}：无生效临界区间`
+        : `t${t}：有效门槛 ${th}（${r.thresholdSources.map((s) => `${s.lineId} 临界区[${s.from},${s.to})`).join('、')}）${
+            blockedHere ? `；阻挡 ${r.blocked.map((b) => b.lineId).join('、')}` : ''
+          }`
+      : '';
+    html += `<td class="cell thcell${sel}" data-tick="${t}" title="${title}" style="${
+      th === null || th === undefined ? '' : 'color:var(--block);font-weight:700'
+    }">${th === null || th === undefined ? '·' : `${blockedHere ? '⊘' : ''}${th}`}</td>`;
+  }
+  html += '</tr>';
+
   // 每线一行
   for (const line of config.lines) {
     const color = lineColor(line.id);
@@ -281,7 +314,11 @@ function renderTimeline(): void {
         const top = r.stack[r.stack.length - 1];
         const isTop = top && top.lineId === line.id;
         const pend = r.pending.find((p) => p.lineId === line.id);
-        if (onStack) {
+        const blk = r.blocked.find((b) => b.lineId === line.id);
+        if (blk) {
+          content = '⊘';
+          title = `被有效门槛 ${blk.threshold} 阻挡：当前优先级 ${blk.priority} 未严格高于门槛（栈顶优先级 ${blk.topPriority}），待处理位保留`;
+        } else if (onStack) {
           bg = isTop
             ? `background:${color}55;box-shadow:inset 0 0 0 1px ${color}`
             : `background:${color}22`;
@@ -321,7 +358,7 @@ function renderTable(): void {
     els.viewTable.innerHTML = '<p class="hint">载入配置后显示逐 tick 记录。</p>';
     return;
   }
-  let html = '<table class="records"><tr><th>tick</th><th>事件(阶段A)</th><th>完成(阶段B)</th><th>动作(阶段C/D)</th><th>执行栈（底→顶）</th><th>待处理证据</th></tr>';
+  let html = '<table class="records"><tr><th>tick</th><th>事件(阶段A)</th><th>完成(阶段B)</th><th>动作(阶段C/D)</th><th>有效门槛(阶段C)</th><th>执行栈（底→顶）</th><th>待处理证据</th></tr>';
   for (const r of controller.ticks) {
     const evs = r.eventsApplied.length
       ? r.eventsApplied
@@ -344,6 +381,24 @@ function renderTable(): void {
     else if (r.action.type === 'continue')
       actionDesc = `<span class="tag continue">执行</span> ${r.action.lineId}（剩余 ${r.topRemaining}）`;
     else actionDesc = '<span class="tag idle">空闲</span>';
+    // 有效门槛与被阻挡原因：与时间轴门槛行、日志 block 记录同源。
+    let thDesc: string;
+    if (r.effectiveThreshold === null) {
+      thDesc = '<span class="mono2">—</span>';
+    } else {
+      const src = r.thresholdSources.map((s) => `${s.lineId}[${s.from},${s.to})`).join('、');
+      thDesc = `<span class="tag block">门槛 ${r.effectiveThreshold}</span> <span class="mono2">${src}</span>`;
+      if (r.blocked.length) {
+        thDesc +=
+          '<br>' +
+          r.blocked
+            .map(
+              (b) =>
+                `<span class="tag block">⊘ ${b.lineId}</span> <span class="mono2">p${b.priority} 未严格高于 ${b.threshold}（栈顶 p${b.topPriority}），待处理位保留</span>`
+            )
+            .join('<br>');
+      }
+    }
     const stack = r.stack.length
       ? r.stack
           .map((f) => {
@@ -358,7 +413,7 @@ function renderTable(): void {
           .join(' ')
       : '<span class="mono2">∅</span>';
     html += `<tr class="${selectedTick === r.tick ? 'hl' : ''}" data-tick="${r.tick}">
-      <td>${r.tick}</td><td>${evs}</td><td>${comp}</td><td>${actionDesc}</td><td>${stack}</td><td>${pend}</td></tr>`;
+      <td>${r.tick}</td><td>${evs}</td><td>${comp}</td><td>${actionDesc}</td><td>${thDesc}</td><td>${stack}</td><td>${pend}</td></tr>`;
   }
   html += '</table>';
   els.viewTable.innerHTML = html;
@@ -405,7 +460,7 @@ function eventZh(k: ScheduledEvent['kind']): string {
 }
 function logZh(t: string): string {
   return (
-    { enter: '进入', preempt: '抢占', resume: '恢复', continue: '执行', complete: '完成', event: '事件', idle: '空闲' } as Record<
+    { enter: '进入', preempt: '抢占', resume: '恢复', continue: '执行', complete: '完成', event: '事件', idle: '空闲', block: '阻挡' } as Record<
       string,
       string
     >

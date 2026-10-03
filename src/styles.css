@@ -13,6 +13,7 @@
   --complete: #b07cf7;
   --idle: #4a556e;
   --masked: #c97a3a;
+  --block: #ff8fcf;
   color-scheme: dark;
 }
 
@@ -409,6 +410,23 @@ table.records tr:hover td {
 .tag.complete { background: rgba(176,124,247,.2); color: var(--complete); }
 .tag.event { background: rgba(139,151,176,.2); color: var(--muted); }
 .tag.idle { background: rgba(74,85,110,.2); color: var(--idle); }
+.tag.block { background: rgba(255,143,207,.16); color: var(--block); }
+
+/* 临界区间：栈帧上的生效标记与门槛行 */
+.lock {
+  display: inline-block;
+  margin-left: 6px;
+  padding: 0 6px;
+  border-radius: 8px;
+  font-size: 10px;
+  background: rgba(255, 143, 207, 0.14);
+  color: var(--block);
+}
+
+td.thcell {
+  color: var(--idle);
+  background: rgba(255, 143, 207, 0.04);
+}
 
 .mono2 {
   color: var(--muted);

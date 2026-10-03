@@ -5,7 +5,9 @@
  *   阶段 A：应用该 tick 的外部事件（raise / lower / mask / unmask）
  *   阶段 B：处理「上一 tick」执行到最后一个 tick 的处理程序完成
  *   阶段 C：调度 —— 栈空时取优先级最高的可运行待处理线进入；
- *           栈非空时，仅严格更高优先级的待处理线可抢占，
+ *           栈非空时，先取执行栈上所有尚未结束临界区间的最高门槛，
+ *           仅「严格高于栈顶优先级、且严格高于该有效门槛」的待处理线
+ *           可抢占；被门槛挡住的线保留原待处理位与排序证据，
  *           同优先级按待处理时刻(since)、ID 排队等待。
  *   阶段 D：栈顶处理程序执行 1 tick（被抢占者此 tick 不消耗 handlerTicks）。
  *
@@ -21,6 +23,10 @@
  *  - setMode 真正切换模式时，旧模式遗留的触发状态全部失效：丢弃该线
  *    的待处理位；切到边沿时同时忘掉已记电平（不合成边沿，与 unmask
  *    不合成边沿同理）。运行中的处理程序不受模式切换影响，继续完成。
+ *  - 临界区间：按帧「已实际执行的拍数」生效（from <= elapsed < to），
+ *    挂起期间不前进；帧恢复后继续计数，帧完成（出栈）即退出。
+ *    有效门槛取栈上所有帧（含被抢占挂起的帧）未结束区间的最高值，
+ *    与阶段 A 的优先级修改在同一拍参与裁决。
  */
 import { comparePending, MAX_TICKS, } from './model.js';
 /** 校验配置与事件，返回告警/错误。 */
@@ -44,6 +50,28 @@ export function validateInput(lines, events) {
         }
         if (ln.mode !== 'edge' && ln.mode !== 'level') {
             errors.push(`线 ${ln.id} 的模式必须是 edge 或 level。`);
+        }
+        const css = ln.criticalSections ?? [];
+        let shapeOk = true;
+        for (const cs of css) {
+            if (!Number.isInteger(cs.from) || !Number.isInteger(cs.to) || !Number.isInteger(cs.threshold)) {
+                errors.push(`线 ${ln.id} 的临界区间 from/to/threshold 必须都是整数。`);
+                shapeOk = false;
+                continue;
+            }
+            if (cs.from < 0 || cs.from >= cs.to || cs.to > ln.handlerTicks) {
+                errors.push(`线 ${ln.id} 的临界区间 [${cs.from}, ${cs.to}) 必须满足 0 <= from < to <= handlerTicks(${ln.handlerTicks})。`);
+                shapeOk = false;
+            }
+        }
+        if (shapeOk) {
+            // 区间互不重叠：按起点排序后，每个区间的起点不得早于前一个区间的终点。
+            const sorted = [...css].sort((a, b) => a.from - b.from);
+            for (let i = 1; i < sorted.length; i++) {
+                if (sorted[i].from < sorted[i - 1].to) {
+                    errors.push(`线 ${ln.id} 的临界区间 [${sorted[i - 1].from}, ${sorted[i - 1].to}) 与 [${sorted[i].from}, ${sorted[i].to}) 重叠。`);
+                }
+            }
         }
     }
     for (const ev of events) {
@@ -240,6 +268,31 @@ export class ReplayController {
             return comparePending(a, b);
         });
     }
+    /**
+     * 有效门槛：执行栈上所有帧（含被抢占挂起的帧）中，已执行拍数落在
+     * [from, to) 内的临界区间的最高门槛；挂起帧的 elapsed 不前进，
+     * 其区间状态随帧恢复/完成而变化。无生效区间时 threshold 为 null。
+     */
+    criticalCeiling() {
+        let best = null;
+        const sources = [];
+        for (const f of this.state.stack) {
+            const cfg = this.state.cfg.get(f.lineId);
+            for (const cs of cfg.criticalSections ?? []) {
+                if (f.elapsed >= cs.from && f.elapsed < cs.to) {
+                    if (best === null || cs.threshold > best) {
+                        best = cs.threshold;
+                        sources.length = 0;
+                        sources.push({ lineId: f.lineId, from: cs.from, to: cs.to, threshold: cs.threshold });
+                    }
+                    else if (cs.threshold === best) {
+                        sources.push({ lineId: f.lineId, from: cs.from, to: cs.to, threshold: cs.threshold });
+                    }
+                }
+            }
+        }
+        return { threshold: best, sources };
+    }
     // ------------------------------------------------------------------
     // 单 tick
     // ------------------------------------------------------------------
@@ -297,6 +350,10 @@ export class ReplayController {
         const winner = runnable[0];
         let action;
         const currentTop = this.state.stack[this.state.stack.length - 1];
+        // 有效门槛：在应用了当拍事件（A）与上一拍完成（B）之后计算，
+        // 本 tick 的抢占裁决、轨迹记录与日志引用同一个值。
+        const ceiling = this.criticalCeiling();
+        const blocked = [];
         if (!currentTop) {
             // 栈空：取优先级最高的可运行待处理线进入。
             if (winner) {
@@ -307,28 +364,53 @@ export class ReplayController {
                 action = { type: 'idle' };
             }
         }
-        else if (winner &&
-            this.state.cfg.get(winner.lineId).priority >
-                this.state.cfg.get(currentTop.lineId).priority) {
+        else {
+            const topPri = this.state.cfg.get(currentTop.lineId).priority;
+            const winPri = winner ? this.state.cfg.get(winner.lineId).priority : null;
             // 仅严格更高优先级可抢占当前程序；同优先级即使等待也不动。
             // 比较用双方「当前」优先级：setPriority 在阶段 A 生效后，
             // 本 tick 的抢占判断即按新优先级执行。
-            currentTop.preempted = true;
-            this.enterFrame(winner, tick);
-            action = { type: 'preempt', by: winner.lineId, resumed: currentTop.lineId };
-            this.logs.push({
-                tick,
-                type: 'preempt',
-                lineId: winner.lineId,
-                detail: `tick ${tick} 抢占：${winner.lineId}（优先级 ${this.state.cfg.get(winner.lineId).priority}）抢占 ${currentTop.lineId}（优先级 ${this.state.cfg.get(currentTop.lineId).priority}），同优先级候选继续等待`,
-            });
-        }
-        else if (currentTop.preempted) {
-            // 抢占者已完成、露出的父帧本 tick 恢复（无更高优先级再抢占）。
-            action = { type: 'resume', lineId: currentTop.lineId };
-        }
-        else {
-            action = { type: 'continue', lineId: currentTop.lineId };
+            // 此外还须严格高于有效门槛：临界区间生效期间，不足够高优先级的
+            // 待处理线被挡在门外，真正紧急（严格更高）的线仍可进入。
+            const deniedByCeiling = winner !== undefined && winPri > topPri && ceiling.threshold !== null && winPri <= ceiling.threshold;
+            if (winner && winPri > topPri && !deniedByCeiling) {
+                currentTop.preempted = true;
+                this.enterFrame(winner, tick);
+                action = { type: 'preempt', by: winner.lineId, resumed: currentTop.lineId };
+                this.logs.push({
+                    tick,
+                    type: 'preempt',
+                    lineId: winner.lineId,
+                    detail: `tick ${tick} 抢占：${winner.lineId}（优先级 ${winPri}）抢占 ${currentTop.lineId}（优先级 ${topPri}）${ceiling.threshold !== null ? `，已严格高于有效门槛 ${ceiling.threshold}` : ''}，同优先级候选继续等待`,
+                });
+            }
+            else {
+                if (deniedByCeiling) {
+                    // 被门槛挡住的线：待处理位与排序证据（since / hits）原样保留。
+                    for (const p of runnable) {
+                        const pp = this.state.cfg.get(p.lineId).priority;
+                        if (pp > topPri) {
+                            blocked.push({ lineId: p.lineId, priority: pp, topPriority: topPri, threshold: ceiling.threshold });
+                        }
+                    }
+                    const src = ceiling.sources.map((s) => `${s.lineId} 临界区[${s.from},${s.to})`).join('、');
+                    this.logs.push({
+                        tick,
+                        type: 'block',
+                        lineId: winner.lineId,
+                        detail: `tick ${tick} 阻挡：${blocked
+                            .map((b) => `${b.lineId}（优先级 ${b.priority}）`)
+                            .join('、')} 未严格高于有效门槛 ${ceiling.threshold}（${src}），抢占被拒，待处理位保留`,
+                    });
+                }
+                if (currentTop.preempted) {
+                    // 抢占者已完成、露出的父帧本 tick 恢复（无更高优先级再抢占）。
+                    action = { type: 'resume', lineId: currentTop.lineId };
+                }
+                else {
+                    action = { type: 'continue', lineId: currentTop.lineId };
+                }
+            }
         }
         // 阶段 D：栈顶执行 1 tick（刚进入的帧也算第 1 个执行 tick；
         // 被抢占而挂起的帧此 tick 不执行、不消耗 handlerTicks）。
@@ -380,6 +462,9 @@ export class ReplayController {
             levelAsserted: [...this.state.levelAsserted].sort(),
             masked: [...this.state.masked].sort(),
             topRemaining: execTop ? execTop.total - execTop.elapsed : null,
+            effectiveThreshold: ceiling.threshold,
+            thresholdSources: ceiling.sources,
+            blocked,
         };
     }
     enterFrame(p, tick) {
