@@ -5,6 +5,13 @@
  * 被测机则用各种不同批次大小推进（advance(1)/advance(3)/一次性 runReplay），
  * 逐 tick 比较归一化后的完整状态快照；再加上手写期望序列核对具体场景。
  */
+/** 参考机自带的一份区间工具（与产品代码相互独立，刻意不共享实现）。 */
+function sectionsOf(cfg) {
+    return [...(cfg.criticalSections ?? [])].sort((a, b) => a.startTick - b.startTick);
+}
+function sectionFor(cfg, nextTick) {
+    return sectionsOf(cfg).find((s) => s.startTick <= nextTick && nextTick <= s.endTick);
+}
 export class ReferenceMachine {
     constructor(lines, events) {
         this.t = 0;
@@ -140,10 +147,17 @@ export class ReferenceMachine {
             if (parent)
                 parent.preempted = true;
         }
-        // ---- 阶段 C：调度 ----
+        // ---- 阶段 C：调度（含临界区间门槛裁决）----
         const runnable = this.orderedRunnable();
-        const win = runnable[0];
         const cur = this.stack[this.stack.length - 1];
+        const arbitration = this.arbitrate(runnable.map((p) => this.pending.find((q) => q.lineId === p.lineId)), cur);
+        const topPri = cur ? this.pri(cur.lineId) : null;
+        const win = runnable.length &&
+            (!cur ||
+                (this.pri(runnable[0].lineId) > topPri &&
+                    (arbitration.priorityFloor === null || this.pri(runnable[0].lineId) > arbitration.priorityFloor)))
+            ? runnable[0]
+            : null;
         let action;
         if (!cur) {
             if (win) {
@@ -156,7 +170,7 @@ export class ReferenceMachine {
             else
                 action = { type: 'idle' };
         }
-        else if (win && this.pri(win.lineId) > this.pri(cur.lineId)) {
+        else if (win) {
             cur.preempted = true;
             const target = this.pending.find((p2) => p2.lineId === win.lineId);
             this.pending.splice(this.pending.indexOf(target), 1);
@@ -189,6 +203,70 @@ export class ReferenceMachine {
             levelAsserted: [...this.level].sort(),
             masked: [...this.masked].sort(),
             topRemaining: exec ? exec.total - exec.elapsed : null,
+            arbitration,
+        };
+    }
+    /**
+     * 独立重写的阶段 C 裁决：扫全栈取下一执行拍（elapsed+1）落在区间内的最高门槛；
+     * 再逐一标注未获准候选的阻挡原因。与 simulator.ts 刻意分开实现。
+     */
+    arbitrate(runnable, cur) {
+        const activeSections = [];
+        for (const f of this.stack) {
+            const sec = sectionFor(this.cfg.get(f.lineId), f.elapsed + 1);
+            if (sec) {
+                activeSections.push({
+                    frameLineId: f.lineId,
+                    startTick: sec.startTick,
+                    endTick: sec.endTick,
+                    priorityFloor: sec.priorityFloor,
+                });
+            }
+        }
+        let priorityFloor = null;
+        let floorSourceLineId = null;
+        for (const s of activeSections) {
+            if (priorityFloor === null || s.priorityFloor > priorityFloor) {
+                priorityFloor = s.priorityFloor;
+                floorSourceLineId = s.frameLineId;
+            }
+        }
+        const topPri = cur ? this.pri(cur.lineId) : null;
+        let grantedId = null;
+        if (runnable.length) {
+            const p0 = this.pri(runnable[0].lineId);
+            const overTop = !cur || p0 > topPri;
+            const overGate = priorityFloor === null || p0 > priorityFloor;
+            if (overTop && overGate)
+                grantedId = runnable[0].lineId;
+        }
+        const blocked = [];
+        for (let i = 0; i < runnable.length; i++) {
+            const p = runnable[i];
+            if (i === 0 && grantedId === p.lineId)
+                continue;
+            const pri = this.pri(p.lineId);
+            let reason;
+            if (cur && pri <= topPri)
+                reason = 'below-top';
+            else if (priorityFloor !== null && pri <= priorityFloor)
+                reason = 'critical-gate';
+            else
+                reason = 'queue';
+            const entry = { lineId: p.lineId, priority: pri, reason };
+            if (reason === 'critical-gate') {
+                entry.priorityFloor = priorityFloor;
+                entry.floorSourceLineId = floorSourceLineId;
+            }
+            blocked.push(entry);
+        }
+        return {
+            topLineId: cur?.lineId ?? null,
+            topPriority: topPri,
+            priorityFloor,
+            floorSourceLineId,
+            activeSections,
+            blocked,
         };
     }
 }

@@ -13,6 +13,8 @@
   --complete: #b07cf7;
   --idle: #4a556e;
   --masked: #c97a3a;
+  --gate: #ff5d8f;
+  --gate-bg: rgba(255, 93, 143, 0.16);
   color-scheme: dark;
 }
 
@@ -317,6 +319,24 @@ td.ev-unmask::before {
   font-size: 9px;
   color: var(--enter);
 }
+td.ev-setPriority::after {
+  content: 'p';
+  position: absolute;
+  top: -3px;
+  right: 1px;
+  font-size: 8px;
+  font-weight: 700;
+  color: #d7b6ff;
+}
+td.ev-setMode::after {
+  content: 'M';
+  position: absolute;
+  top: -3px;
+  right: 1px;
+  font-size: 8px;
+  font-weight: 700;
+  color: #7ae0d4;
+}
 
 td.cell {
   cursor: pointer;
@@ -413,3 +433,63 @@ table.records tr:hover td {
   color: #fff;
   background: #1d3a66;
 }
+
+/* 临界执行区间 */
+.chip .crit {
+  color: var(--gate);
+}
+.gatecard {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--panel2);
+  padding: 6px 9px;
+  margin-bottom: 8px;
+}
+.gatefloor {
+  color: var(--gate);
+  font-size: 11px;
+  font-weight: 700;
+}
+.gatesecs {
+  margin-top: 4px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+.crit-badge {
+  display: inline-block;
+  border: 1px solid var(--gate);
+  color: var(--gate);
+  border-radius: 8px;
+  padding: 0 6px;
+  margin-left: 6px;
+  font-size: 9px;
+  white-space: nowrap;
+}
+.frame.critical {
+  box-shadow: inset 3px 0 0 var(--gate);
+}
+.frame.top.critical {
+  box-shadow: 0 0 0 1px var(--accent), inset 3px 0 0 var(--gate);
+}
+.blocklist {
+  margin-top: 5px;
+}
+.pill.block-gate {
+  color: var(--gate);
+  border-color: var(--gate);
+  background: var(--gate-bg);
+}
+.pill.block-other {
+  color: var(--muted);
+}
+.tag.gate {
+  background: var(--gate-bg);
+  color: var(--gate);
+  font-weight: 700;
+}
+.tag.block {
+  background: var(--gate-bg);
+  color: var(--gate);
+}
+

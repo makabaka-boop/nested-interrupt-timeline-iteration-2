@@ -6,6 +6,12 @@ function comparePending(a, b) {
 }
 
 // src/simulator.ts
+function sortedSections(cfg) {
+  return [...cfg.criticalSections ?? []].sort((a, b) => a.startTick - b.startTick);
+}
+function activeSectionAt(cfg, nextTick) {
+  return sortedSections(cfg).find((s) => s.startTick <= nextTick && nextTick <= s.endTick);
+}
 function validateInput(lines, events) {
   const errors = [];
   const warnings = [];
@@ -23,6 +29,29 @@ function validateInput(lines, events) {
     }
     if (ln.mode !== "edge" && ln.mode !== "level") {
       errors.push(`\u7EBF ${ln.id} \u7684\u6A21\u5F0F\u5FC5\u987B\u662F edge \u6216 level\u3002`);
+    }
+    const secs = ln.criticalSections ?? [];
+    for (const s of secs) {
+      if (!Number.isInteger(s.startTick) || !Number.isInteger(s.endTick) || !Number.isInteger(s.priorityFloor)) {
+        errors.push(`\u7EBF ${ln.id} \u7684\u4E34\u754C\u533A\u95F4 startTick/endTick/priorityFloor \u5FC5\u987B\u5168\u90E8\u4E3A\u6574\u6570\u3002`);
+        continue;
+      }
+      if (s.startTick < 1 || s.endTick < s.startTick) {
+        errors.push(`\u7EBF ${ln.id} \u7684\u4E34\u754C\u533A\u95F4\u975E\u6CD5\uFF1A\u9700 1 <= startTick <= endTick\uFF08\u5F97\u5230 ${s.startTick}..${s.endTick}\uFF09\u3002`);
+      }
+      if (Number.isInteger(ln.handlerTicks) && s.endTick > ln.handlerTicks) {
+        errors.push(`\u7EBF ${ln.id} \u7684\u4E34\u754C\u533A\u95F4\u7EC8\u70B9 ${s.endTick} \u8D85\u51FA handlerTicks=${ln.handlerTicks}\u3002`);
+      }
+    }
+    if (secs.length >= 2) {
+      const sorted = [...secs].sort((a, b) => a.startTick - b.startTick);
+      for (let i = 1; i < sorted.length; i++) {
+        if (sorted[i].startTick <= sorted[i - 1].endTick) {
+          errors.push(
+            `\u7EBF ${ln.id} \u7684\u4E34\u754C\u533A\u95F4\u91CD\u53E0\uFF1A[${sorted[i - 1].startTick}, ${sorted[i - 1].endTick}] \u4E0E [${sorted[i].startTick}, ${sorted[i].endTick}]\u3002`
+          );
+        }
+      }
     }
   }
   for (const ev of events) {
@@ -187,6 +216,65 @@ var ReplayController = class {
       return comparePending(a, b);
     });
   }
+  /**
+   * 阶段 C 裁决证据：从执行栈中所有「尚未结束」的临界区间取最高门槛。
+   * 区间是否生效取决于每帧「下一拍将实际执行的拍号 elapsed+1」——
+   * 挂起帧的 elapsed 不前进，区间随之冻结；恢复后区间随帧继续生效。
+   * 阶段 B 已把上一拍完成的帧弹出，故此处只剩仍未结束的帧。
+   */
+  buildArbitration(runnable, currentTop) {
+    const activeSections = [];
+    for (const f of this.state.stack) {
+      const cfg = this.state.cfg.get(f.lineId);
+      const sec = activeSectionAt(cfg, f.elapsed + 1);
+      if (sec) {
+        activeSections.push({
+          frameLineId: f.lineId,
+          startTick: sec.startTick,
+          endTick: sec.endTick,
+          priorityFloor: sec.priorityFloor
+        });
+      }
+    }
+    let priorityFloor = null;
+    let floorSourceLineId = null;
+    for (const s of activeSections) {
+      if (priorityFloor === null || s.priorityFloor > priorityFloor) {
+        priorityFloor = s.priorityFloor;
+        floorSourceLineId = s.frameLineId;
+      }
+    }
+    const topPri = currentTop ? this.state.cfg.get(currentTop.lineId).priority : null;
+    const grantedId = runnable.length > 0 && (currentTop === void 0 || this.state.cfg.get(runnable[0].lineId).priority > topPri && (priorityFloor === null || this.state.cfg.get(runnable[0].lineId).priority > priorityFloor)) ? runnable[0].lineId : null;
+    const blocked = [];
+    for (let i = 0; i < runnable.length; i++) {
+      const p = runnable[i];
+      if (i === 0 && grantedId === p.lineId) continue;
+      const pri = this.state.cfg.get(p.lineId).priority;
+      let reason;
+      if (currentTop && pri <= topPri) {
+        reason = "below-top";
+      } else if (priorityFloor !== null && pri <= priorityFloor) {
+        reason = "critical-gate";
+      } else {
+        reason = "queue";
+      }
+      const entry = { lineId: p.lineId, priority: pri, reason };
+      if (reason === "critical-gate") {
+        entry.priorityFloor = priorityFloor;
+        entry.floorSourceLineId = floorSourceLineId;
+      }
+      blocked.push(entry);
+    }
+    return {
+      topLineId: currentTop?.lineId ?? null,
+      topPriority: topPri,
+      priorityFloor,
+      floorSourceLineId,
+      activeSections,
+      blocked
+    };
+  }
   // ------------------------------------------------------------------
   // 单 tick
   // ------------------------------------------------------------------
@@ -226,17 +314,34 @@ var ReplayController = class {
       if (parent) parent.preempted = true;
     }
     const runnable = this.runnablePending();
-    const winner = runnable[0];
-    let action;
     const currentTop = this.state.stack[this.state.stack.length - 1];
+    const arbitration = this.buildArbitration(runnable, currentTop);
+    const winner = runnable[0];
+    const granted = winner && (!currentTop || // 待处理线只有「同时严格高于当前栈顶」且「严格高于有效门槛」才能抢占。
+    this.state.cfg.get(winner.lineId).priority > this.state.cfg.get(currentTop.lineId).priority && (arbitration.priorityFloor === null || this.state.cfg.get(winner.lineId).priority > arbitration.priorityFloor));
+    let action;
+    for (const b of arbitration.blocked) {
+      if (b.reason !== "critical-gate") continue;
+      const src = arbitration.activeSections.find(
+        (s) => s.frameLineId === b.floorSourceLineId && s.priorityFloor === b.priorityFloor
+      );
+      const p = this.state.pending.find((x) => x.lineId === b.lineId);
+      this.logs.push({
+        tick,
+        type: "block",
+        lineId: b.lineId,
+        priorityFloor: b.priorityFloor,
+        detail: `tick ${tick} \u963B\u6321\uFF1A${b.lineId}\uFF08\u4F18\u5148\u7EA7 ${b.priority}\uFF09\u4E0D\u4E25\u683C\u9AD8\u4E8E\u4E34\u754C\u95E8\u69DB ${b.priorityFloor}\uFF08${src ? `${b.floorSourceLineId} \u7B2C ${src.startTick}..${src.endTick} \u62CD\u533A\u95F4` : b.floorSourceLineId}\uFF09\uFF0C\u5F85\u5904\u7406\u4F4D\u4FDD\u7559\uFF08since t${p?.since ?? "?"}\uFF09`
+      });
+    }
     if (!currentTop) {
-      if (winner) {
+      if (granted) {
         this.enterFrame(winner, tick);
         action = { type: "enter", lineId: winner.lineId };
       } else {
         action = { type: "idle" };
       }
-    } else if (winner && this.state.cfg.get(winner.lineId).priority > this.state.cfg.get(currentTop.lineId).priority) {
+    } else if (granted) {
       currentTop.preempted = true;
       this.enterFrame(winner, tick);
       action = { type: "preempt", by: winner.lineId, resumed: currentTop.lineId };
@@ -244,7 +349,8 @@ var ReplayController = class {
         tick,
         type: "preempt",
         lineId: winner.lineId,
-        detail: `tick ${tick} \u62A2\u5360\uFF1A${winner.lineId}\uFF08\u4F18\u5148\u7EA7 ${this.state.cfg.get(winner.lineId).priority}\uFF09\u62A2\u5360 ${currentTop.lineId}\uFF08\u4F18\u5148\u7EA7 ${this.state.cfg.get(currentTop.lineId).priority}\uFF09\uFF0C\u540C\u4F18\u5148\u7EA7\u5019\u9009\u7EE7\u7EED\u7B49\u5F85`
+        priorityFloor: arbitration.priorityFloor,
+        detail: `tick ${tick} \u62A2\u5360\uFF1A${winner.lineId}\uFF08\u4F18\u5148\u7EA7 ${this.state.cfg.get(winner.lineId).priority}\uFF09\u62A2\u5360 ${currentTop.lineId}\uFF08\u4F18\u5148\u7EA7 ${this.state.cfg.get(currentTop.lineId).priority}\uFF09\uFF0C\u5F53\u524D\u4E34\u754C\u95E8\u69DB ${arbitration.priorityFloor === null ? "\u65E0" : arbitration.priorityFloor}`
       });
     } else if (currentTop.preempted) {
       action = { type: "resume", lineId: currentTop.lineId };
@@ -294,7 +400,8 @@ var ReplayController = class {
       pending: this.state.pending.slice().sort(comparePending).map((p) => ({ ...p })),
       levelAsserted: [...this.state.levelAsserted].sort(),
       masked: [...this.state.masked].sort(),
-      topRemaining: execTop ? execTop.total - execTop.elapsed : null
+      topRemaining: execTop ? execTop.total - execTop.elapsed : null,
+      arbitration
     };
   }
   enterFrame(p, tick) {
@@ -411,6 +518,36 @@ var DEMOS = [
       { at: 4, lineId: "E", kind: "setMode", mode: "level" },
       { at: 4, lineId: "E", kind: "unmask" }
     ]
+  },
+  {
+    name: "\u4E34\u754C\u6267\u884C\u533A\u95F4\uFF08\u5171\u4EAB\u5BC4\u5B58\u5668\u4FDD\u62A4\uFF09",
+    description: "A \u5199\u5171\u4EAB\u5BC4\u5B58\u5668\u7684\u7B2C 2..4 \u62CD\u8BBE\u7F6E\u6574\u6570\u95E8\u69DB 5\uFF1AB(\u4F18\u5148\u7EA74) \u5728\u6B64\u671F\u95F4\u88AB\u6321\u4E14\u4FDD\u7559\u5F85\u5904\u7406\u4F4D\uFF0CC(\u4F18\u5148\u7EA76) \u4F5C\u4E3A\u771F\u6B63\u7D27\u6025\u7684\u4E2D\u65AD\u4ECD\u53EF\u8FDB\u5165\uFF1B\u533A\u95F4\u7ED3\u675F\u540E B \u624D\u88AB\u51C6\u8BB8\u62A2\u5360\u3002\u533A\u95F4\u6309 A \u5B9E\u9645\u6267\u884C\u62CD\u8BA1\u6570\uFF0C\u88AB C \u62A2\u5360\u6302\u8D77\u671F\u95F4\u4E0D\u524D\u8FDB\u3002",
+    lines: [
+      { id: "A", priority: 2, mode: "edge", handlerTicks: 5, criticalSections: [{ startTick: 2, endTick: 4, priorityFloor: 5 }] },
+      { id: "B", priority: 4, mode: "edge", handlerTicks: 1 },
+      { id: "C", priority: 6, mode: "edge", handlerTicks: 1 }
+    ],
+    events: [
+      { at: 1, lineId: "A", kind: "raise" },
+      { at: 2, lineId: "B", kind: "raise" },
+      { at: 3, lineId: "C", kind: "raise" }
+    ]
+  },
+  {
+    name: "\u5D4C\u5957\u4E34\u754C\u95E8\u69DB\uFF08\u53D6\u5168\u6808\u6700\u9AD8\uFF09",
+    description: "A \u7684\u4E34\u754C\u533A\u95F4\u95E8\u69DB 3\uFF08\u7B2C2..7\u62CD\uFF09\u5141\u8BB8 B(4) \u62A2\u5360\uFF1BB \u81EA\u8EAB\u7B2C 2 \u62CD\u533A\u95F4\u95E8\u69DB 6 \u6321\u4F4F C(5)\uFF08\u6709\u6548\u95E8\u69DB\u53D6\u6267\u884C\u6808\u6240\u6709\u672A\u7ED3\u675F\u533A\u95F4\u7684\u6700\u9AD8\u503C\uFF09\uFF0CHi(7) \u4ECD\u53EF\u8FDB\u5165\uFF1BB \u533A\u95F4\u9000\u51FA\u540E\u95E8\u69DB\u56DE\u843D\u5230 A \u7684 3\u3002",
+    lines: [
+      { id: "A", priority: 1, mode: "edge", handlerTicks: 8, criticalSections: [{ startTick: 2, endTick: 7, priorityFloor: 3 }] },
+      { id: "B", priority: 4, mode: "edge", handlerTicks: 3, criticalSections: [{ startTick: 2, endTick: 2, priorityFloor: 6 }] },
+      { id: "C", priority: 5, mode: "edge", handlerTicks: 1 },
+      { id: "Hi", priority: 7, mode: "edge", handlerTicks: 1 }
+    ],
+    events: [
+      { at: 1, lineId: "A", kind: "raise" },
+      { at: 2, lineId: "B", kind: "raise" },
+      { at: 3, lineId: "C", kind: "raise" },
+      { at: 4, lineId: "Hi", kind: "raise" }
+    ]
   }
 ];
 
@@ -429,6 +566,7 @@ var els = {
   errors: $("#errors"),
   warns: $("#warns"),
   chips: $("#chips"),
+  gateBox: $("#gateBox"),
   tickNo: $("#tickNo"),
   remaining: $("#remaining"),
   stackView: $("#stackView"),
@@ -539,9 +677,41 @@ function renderChips() {
   for (const l of config.lines) {
     const c = document.createElement("span");
     c.className = "chip";
-    c.innerHTML = `<b style="color:${lineColor(l.id)}">${l.id}</b> \xB7 p${l.priority} \xB7 ${l.mode === "edge" ? "\u8FB9\u6CBF" : "\u7535\u5E73"} \xB7 ${l.handlerTicks}t${l.initiallyMasked ? " \xB7 \u5DF2\u5C4F\u853D" : ""}`;
+    const secs = [...l.criticalSections ?? []].sort((a, b) => a.startTick - b.startTick);
+    const secText = secs.length ? ` \xB7 \u4E34\u754C ${secs.map((s) => `${s.startTick}-${s.endTick}\u62CD\u95E8\u69DB${s.priorityFloor}`).join("/")}` : "";
+    c.innerHTML = `<b style="color:${lineColor(l.id)}">${l.id}</b> \xB7 p${l.priority} \xB7 ${l.mode === "edge" ? "\u8FB9\u6CBF" : "\u7535\u5E73"} \xB7 ${l.handlerTicks}t${l.initiallyMasked ? " \xB7 \u5DF2\u5C4F\u853D" : ""}<span class="crit">${secText}</span>`;
     els.chips.appendChild(c);
   }
+}
+function reasonZh(reason) {
+  switch (reason) {
+    case "critical-gate":
+      return "\u88AB\u4E34\u754C\u95E8\u69DB\u6321\u4E0B\uFF08\u4F18\u5148\u7EA7\u4E0D\u4E25\u683C\u9AD8\u4E8E\u95E8\u69DB\uFF09";
+    case "below-top":
+      return "\u4F18\u5148\u7EA7\u4E0D\u4E25\u683C\u9AD8\u4E8E\u6808\u9876";
+    case "queue":
+      return "\u540C\u4F18\u5148\u7EA7\u6309 since/ID \u6392\u5E8F\u843D\u9009";
+    default:
+      return reason;
+  }
+}
+function renderGate(rec) {
+  const arb = rec.arbitration;
+  const active = arb.activeSections;
+  let html = '<div class="gatecard">';
+  html += arb.priorityFloor === null ? '<span class="hint">\u672C\u62CD\u65E0\u751F\u6548\u4E34\u754C\u533A\u95F4\uFF08\u65E0\u9644\u52A0\u95E8\u69DB\uFF09</span>' : `<span class="gatefloor">\u6709\u6548\u95E8\u69DB \u2265 ${arb.priorityFloor + 1}\uFF08floor=${arb.priorityFloor}\uFF0C\u6765\u81EA ${arb.floorSourceLineId}\uFF09</span>`;
+  if (active.length) {
+    html += '<div class="gatesecs">' + active.map((s) => `<span class="crit-badge" style="border-color:${lineColor(s.frameLineId)}">${s.frameLineId} \u7B2C ${s.startTick}..${s.endTick} \u62CD \xB7 \u95E8\u69DB${s.priorityFloor}</span>`).join(" ") + "</div>";
+  }
+  html += "</div>";
+  if (arb.blocked.length) {
+    html += '<div class="blocklist">' + arb.blocked.map((b) => {
+      const cls = b.reason === "critical-gate" ? "block-gate" : "block-other";
+      const extra = b.reason === "critical-gate" ? ` \xB7 floor ${b.priorityFloor}` : "";
+      return `<span class="pill ${cls}" style="border-color:${lineColor(b.lineId)}" title="${reasonZh(b.reason)}">\u26D4 ${b.lineId} p${b.priority}${extra}</span>`;
+    }).join(" ") + "</div>";
+  }
+  els.gateBox.innerHTML = html;
 }
 function currentRecord() {
   if (!controller || controller.ticks.length === 0) return null;
@@ -551,6 +721,7 @@ function currentRecord() {
 function renderState(rec) {
   els.tickNo.textContent = rec ? String(rec.tick) : controller ? "0\uFF08\u672A\u5F00\u59CB\uFF09" : "\u2014";
   if (!rec) {
+    els.gateBox.innerHTML = "";
     els.stackView.innerHTML = '<span class="hint">\u65E0\u6267\u884C\u5E27</span>';
     els.pendingBox.innerHTML = '<span class="hint">\u2014</span>';
     els.levelBox.innerHTML = '<span class="hint">\u2014</span>';
@@ -559,6 +730,7 @@ function renderState(rec) {
     return;
   }
   els.remaining.textContent = rec.topRemaining === null ? "\u7A7A\u95F2" : `${rec.topRemaining} tick`;
+  renderGate(rec);
   els.stackView.innerHTML = "";
   if (rec.stack.length === 0) {
     els.stackView.innerHTML = '<span class="hint">CPU \u7A7A\u95F2</span>';
@@ -567,13 +739,16 @@ function renderState(rec) {
     const cfg = config.lines.find((l) => l.id === f.lineId);
     const top = i === rec.stack.length - 1;
     const pct = Math.round(f.elapsed / f.total * 100);
+    const sec = [...cfg.criticalSections ?? []].sort((a, b) => a.startTick - b.startTick).find((s) => s.startTick <= f.elapsed + 1 && f.elapsed + 1 <= s.endTick);
+    const secBadge = sec ? `<span class="crit-badge">\u4E34\u754C \u95E8\u69DB${sec.priorityFloor}</span>` : "";
     const div = document.createElement("div");
-    div.className = "frame" + (top ? " top" : "");
+    div.className = "frame" + (top ? " top" : "") + (sec ? " critical" : "");
     div.style.borderLeftColor = lineColor(f.lineId);
     div.innerHTML = `
       <div style="flex:1">
         <b style="color:${lineColor(f.lineId)}">${f.lineId}</b>
         <span class="mono2"> p${cfg.priority} \xB7 ${cfg.mode === "edge" ? "\u8FB9\u6CBF" : "\u7535\u5E73"}</span>
+        ${secBadge}
         <div class="bar"><i style="width:${pct}%;background:${lineColor(f.lineId)}"></i></div>
       </div>
       <div class="mono2" style="white-space:nowrap">${f.elapsed}/${f.total} tick</div>`;
@@ -638,10 +813,25 @@ function renderTimeline() {
         const top = r.stack[r.stack.length - 1];
         const isTop = top && top.lineId === line.id;
         const pend = r.pending.find((p) => p.lineId === line.id);
+        const frame = r.stack.find((f) => f.lineId === line.id);
+        const inSection = frame && [...line.criticalSections ?? []].some(
+          (s) => s.startTick <= frame.elapsed + 1 && frame.elapsed + 1 <= s.endTick
+        );
+        const blockedByGate = r.arbitration.blocked.find((b) => b.lineId === line.id && b.reason === "critical-gate");
         if (onStack) {
           bg = isTop ? `background:${color}55;box-shadow:inset 0 0 0 1px ${color}` : `background:${color}22`;
           content = isTop ? "\u25B6" : "\u2225";
           title = isTop ? "\u6B63\u5728\u6267\u884C" : "\u88AB\u62A2\u5360\u6302\u8D77";
+          if (inSection) {
+            const sec = [...line.criticalSections ?? []].sort((a, b) => a.startTick - b.startTick).find((s) => s.startTick <= frame.elapsed + 1 && frame.elapsed + 1 <= s.endTick);
+            content += "\u{1F512}";
+            title += `\uFF1B\u4E34\u754C\u533A\u95F4\u751F\u6548\uFF08\u95E8\u69DB ${sec.priorityFloor}\uFF0C\u6309\u5B9E\u9645\u6267\u884C\u62CD ${frame.elapsed + 1}\uFF09`;
+            if (isTop) bg = `background:${color}66;box-shadow:inset 0 0 0 2px var(--gate)`;
+          }
+        } else if (blockedByGate) {
+          content = "\u26D4";
+          title = `\u88AB\u4E34\u754C\u95E8\u69DB\u6321\u4E0B\uFF1Ap${blockedByGate.priority} \u4E0D\u4E25\u683C\u9AD8\u4E8E\u95E8\u69DB ${blockedByGate.priorityFloor}\uFF08\u5F85\u5904\u7406\u4F4D\u4FDD\u7559\uFF09`;
+          bg = "background:var(--gate-bg)";
         } else if (pend) {
           content = `P${pend.hits > 1 ? pend.hits : ""}`;
           title = `\u5F85\u5904\u7406 since t${pend.since}\uFF0C\u5408\u5E76 ${pend.hits} \u6B21`;
@@ -671,7 +861,7 @@ function renderTable() {
     els.viewTable.innerHTML = '<p class="hint">\u8F7D\u5165\u914D\u7F6E\u540E\u663E\u793A\u9010 tick \u8BB0\u5F55\u3002</p>';
     return;
   }
-  let html = '<table class="records"><tr><th>tick</th><th>\u4E8B\u4EF6(\u9636\u6BB5A)</th><th>\u5B8C\u6210(\u9636\u6BB5B)</th><th>\u52A8\u4F5C(\u9636\u6BB5C/D)</th><th>\u6267\u884C\u6808\uFF08\u5E95\u2192\u9876\uFF09</th><th>\u5F85\u5904\u7406\u8BC1\u636E</th></tr>';
+  let html = '<table class="records"><tr><th>tick</th><th>\u4E8B\u4EF6(\u9636\u6BB5A)</th><th>\u5B8C\u6210(\u9636\u6BB5B)</th><th>\u52A8\u4F5C(\u9636\u6BB5C/D)</th><th>\u4E34\u754C\u95E8\u69DB/\u963B\u6321(\u9636\u6BB5C)</th><th>\u6267\u884C\u6808\uFF08\u5E95\u2192\u9876\uFF09</th><th>\u5F85\u5904\u7406\u8BC1\u636E</th></tr>';
   for (const r of controller.ticks) {
     const evs = r.eventsApplied.length ? r.eventsApplied.map(
       (e) => `<span class="tag event">${e.lineId}\xB7${eventZh(e.kind)}${e.kind === "setPriority" ? `\u2192p${e.priority}` : e.kind === "setMode" ? `\u2192${e.mode === "edge" ? "\u8FB9\u6CBF" : "\u7535\u5E73"}` : ""}</span>`
@@ -687,13 +877,30 @@ function renderTable() {
     else if (r.action.type === "continue")
       actionDesc = `<span class="tag continue">\u6267\u884C</span> ${r.action.lineId}\uFF08\u5269\u4F59 ${r.topRemaining}\uFF09`;
     else actionDesc = '<span class="tag idle">\u7A7A\u95F2</span>';
+    const arb = r.arbitration;
+    let gateDesc;
+    if (arb.priorityFloor !== null) {
+      gateDesc = `<span class="tag gate">\u95E8\u69DB${arb.priorityFloor}@${arb.floorSourceLineId}</span>`;
+    } else {
+      gateDesc = '<span class="mono2">\u65E0</span>';
+    }
+    if (arb.blocked.length) {
+      gateDesc += '<div class="blocklist">' + arb.blocked.map((b) => {
+        const cls = b.reason === "critical-gate" ? "block-gate" : "block-other";
+        return `<span class="pill ${cls}" style="border-color:${lineColor(b.lineId)}" title="${reasonZh(b.reason)}">\u26D4${b.lineId}${b.reason === "critical-gate" ? `\u2264${b.priorityFloor}` : ""}</span>`;
+      }).join(" ") + "</div>";
+    }
     const stack = r.stack.length ? r.stack.map((f) => {
       const top = f === r.stack[r.stack.length - 1];
-      return `<span style="color:${lineColor(f.lineId)}">${top ? "\u25B6" : "\u2225"}${f.lineId}(${f.elapsed}/${f.total})</span>`;
+      const cfg = config.lines.find((l) => l.id === f.lineId);
+      const inSec = [...cfg.criticalSections ?? []].some(
+        (s) => s.startTick <= f.elapsed + 1 && f.elapsed + 1 <= s.endTick
+      );
+      return `<span style="color:${lineColor(f.lineId)}">${top ? "\u25B6" : "\u2225"}${f.lineId}(${f.elapsed}/${f.total})${inSec ? "\u{1F512}" : ""}</span>`;
     }).join(" \u2190 ") : '<span class="mono2">\u2205</span>';
     const pend = r.pending.length ? r.pending.map((p) => `<span class="pill ${p.kind}" style="border-color:${lineColor(p.lineId)}">${p.lineId} since t${p.since} \xD7${p.hits}</span>`).join(" ") : '<span class="mono2">\u2205</span>';
     html += `<tr class="${selectedTick === r.tick ? "hl" : ""}" data-tick="${r.tick}">
-      <td>${r.tick}</td><td>${evs}</td><td>${comp}</td><td>${actionDesc}</td><td>${stack}</td><td>${pend}</td></tr>`;
+      <td>${r.tick}</td><td>${evs}</td><td>${comp}</td><td>${actionDesc}</td><td>${gateDesc}</td><td>${stack}</td><td>${pend}</td></tr>`;
   }
   html += "</table>";
   els.viewTable.innerHTML = html;
@@ -736,7 +943,7 @@ function eventZh(k) {
   }
 }
 function logZh(t) {
-  return { enter: "\u8FDB\u5165", preempt: "\u62A2\u5360", resume: "\u6062\u590D", continue: "\u6267\u884C", complete: "\u5B8C\u6210", event: "\u4E8B\u4EF6", idle: "\u7A7A\u95F2" }[t] ?? t;
+  return { enter: "\u8FDB\u5165", preempt: "\u62A2\u5360", resume: "\u6062\u590D", continue: "\u6267\u884C", complete: "\u5B8C\u6210", block: "\u963B\u6321", event: "\u4E8B\u4EF6", idle: "\u7A7A\u95F2" }[t] ?? t;
 }
 function selectTick(t) {
   selectedTick = t;

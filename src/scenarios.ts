@@ -82,4 +82,36 @@ export const DEMOS: Demo[] = [
       { at: 4, lineId: 'E', kind: 'unmask' },
     ],
   },
+  {
+    name: '临界执行区间（共享寄存器保护）',
+    description:
+      'A 写共享寄存器的第 2..4 拍设置整数门槛 5：B(优先级4) 在此期间被挡且保留待处理位，C(优先级6) 作为真正紧急的中断仍可进入；区间结束后 B 才被准许抢占。区间按 A 实际执行拍计数，被 C 抢占挂起期间不前进。',
+    lines: [
+      { id: 'A', priority: 2, mode: 'edge', handlerTicks: 5, criticalSections: [{ startTick: 2, endTick: 4, priorityFloor: 5 }] },
+      { id: 'B', priority: 4, mode: 'edge', handlerTicks: 1 },
+      { id: 'C', priority: 6, mode: 'edge', handlerTicks: 1 },
+    ],
+    events: [
+      { at: 1, lineId: 'A', kind: 'raise' },
+      { at: 2, lineId: 'B', kind: 'raise' },
+      { at: 3, lineId: 'C', kind: 'raise' },
+    ],
+  },
+  {
+    name: '嵌套临界门槛（取全栈最高）',
+    description:
+      'A 的临界区间门槛 3（第2..7拍）允许 B(4) 抢占；B 自身第 2 拍区间门槛 6 挡住 C(5)（有效门槛取执行栈所有未结束区间的最高值），Hi(7) 仍可进入；B 区间退出后门槛回落到 A 的 3。',
+    lines: [
+      { id: 'A', priority: 1, mode: 'edge', handlerTicks: 8, criticalSections: [{ startTick: 2, endTick: 7, priorityFloor: 3 }] },
+      { id: 'B', priority: 4, mode: 'edge', handlerTicks: 3, criticalSections: [{ startTick: 2, endTick: 2, priorityFloor: 6 }] },
+      { id: 'C', priority: 5, mode: 'edge', handlerTicks: 1 },
+      { id: 'Hi', priority: 7, mode: 'edge', handlerTicks: 1 },
+    ],
+    events: [
+      { at: 1, lineId: 'A', kind: 'raise' },
+      { at: 2, lineId: 'B', kind: 'raise' },
+      { at: 3, lineId: 'C', kind: 'raise' },
+      { at: 4, lineId: 'Hi', kind: 'raise' },
+    ],
+  },
 ];

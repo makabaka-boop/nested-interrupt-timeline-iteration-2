@@ -24,6 +24,7 @@ const els = {
   errors: $<HTMLDivElement>('#errors'),
   warns: $<HTMLDivElement>('#warns'),
   chips: $<HTMLDivElement>('#chips'),
+  gateBox: $<HTMLDivElement>('#gateBox'),
   tickNo: $<HTMLSpanElement>('#tickNo'),
   remaining: $<HTMLSpanElement>('#remaining'),
   stackView: $<HTMLDivElement>('#stackView'),
@@ -154,11 +155,61 @@ function renderChips(): void {
   for (const l of config.lines) {
     const c = document.createElement('span');
     c.className = 'chip';
+    const secs = [...(l.criticalSections ?? [])].sort((a, b) => a.startTick - b.startTick);
+    const secText = secs.length
+      ? ` · 临界 ${secs.map((s) => `${s.startTick}-${s.endTick}拍门槛${s.priorityFloor}`).join('/')}`
+      : '';
     c.innerHTML = `<b style="color:${lineColor(l.id)}">${l.id}</b> · p${l.priority} · ${
       l.mode === 'edge' ? '边沿' : '电平'
-    } · ${l.handlerTicks}t${l.initiallyMasked ? ' · 已屏蔽' : ''}`;
+    } · ${l.handlerTicks}t${l.initiallyMasked ? ' · 已屏蔽' : ''}<span class="crit">${secText}</span>`;
     els.chips.appendChild(c);
   }
+}
+
+// ---------- 临界门槛 / 阻挡证据 ----------
+function reasonZh(reason: string): string {
+  switch (reason) {
+    case 'critical-gate':
+      return '被临界门槛挡下（优先级不严格高于门槛）';
+    case 'below-top':
+      return '优先级不严格高于栈顶';
+    case 'queue':
+      return '同优先级按 since/ID 排序落选';
+    default:
+      return reason;
+  }
+}
+
+function renderGate(rec: TickRecord): void {
+  const arb = rec.arbitration;
+  const active = arb.activeSections;
+  let html = '<div class="gatecard">';
+  html +=
+    arb.priorityFloor === null
+      ? '<span class="hint">本拍无生效临界区间（无附加门槛）</span>'
+      : `<span class="gatefloor">有效门槛 ≥ ${arb.priorityFloor + 1}（floor=${arb.priorityFloor}，来自 ${arb.floorSourceLineId}）</span>`;
+  if (active.length) {
+    html +=
+      '<div class="gatesecs">' +
+      active
+        .map((s) => `<span class="crit-badge" style="border-color:${lineColor(s.frameLineId)}">${s.frameLineId} 第 ${s.startTick}..${s.endTick} 拍 · 门槛${s.priorityFloor}</span>`)
+        .join(' ') +
+      '</div>';
+  }
+  html += '</div>';
+  if (arb.blocked.length) {
+    html +=
+      '<div class="blocklist">' +
+      arb.blocked
+        .map((b) => {
+          const cls = b.reason === 'critical-gate' ? 'block-gate' : 'block-other';
+          const extra = b.reason === 'critical-gate' ? ` · floor ${b.priorityFloor}` : '';
+          return `<span class="pill ${cls}" style="border-color:${lineColor(b.lineId)}" title="${reasonZh(b.reason)}">⛔ ${b.lineId} p${b.priority}${extra}</span>`;
+        })
+        .join(' ') +
+      '</div>';
+  }
+  els.gateBox.innerHTML = html;
 }
 
 // ---------- 当前 tick 状态卡 ----------
@@ -171,6 +222,7 @@ function currentRecord(): TickRecord | null {
 function renderState(rec: TickRecord | null): void {
   els.tickNo.textContent = rec ? String(rec.tick) : controller ? '0（未开始）' : '—';
   if (!rec) {
+    els.gateBox.innerHTML = '';
     els.stackView.innerHTML = '<span class="hint">无执行帧</span>';
     els.pendingBox.innerHTML = '<span class="hint">—</span>';
     els.levelBox.innerHTML = '<span class="hint">—</span>';
@@ -179,6 +231,7 @@ function renderState(rec: TickRecord | null): void {
     return;
   }
   els.remaining.textContent = rec.topRemaining === null ? '空闲' : `${rec.topRemaining} tick`;
+  renderGate(rec);
 
   // 执行栈（自底向上）
   els.stackView.innerHTML = '';
@@ -189,13 +242,19 @@ function renderState(rec: TickRecord | null): void {
     const cfg = config!.lines.find((l) => l.id === f.lineId)!;
     const top = i === rec.stack.length - 1;
     const pct = Math.round((f.elapsed / f.total) * 100);
+    // 该帧下一拍（elapsed+1）是否落在某个临界区间内（与裁决用同一判定）。
+    const sec = [...(cfg.criticalSections ?? [])]
+      .sort((a, b) => a.startTick - b.startTick)
+      .find((s) => s.startTick <= f.elapsed + 1 && f.elapsed + 1 <= s.endTick);
+    const secBadge = sec ? `<span class="crit-badge">临界 门槛${sec.priorityFloor}</span>` : '';
     const div = document.createElement('div');
-    div.className = 'frame' + (top ? ' top' : '');
+    div.className = 'frame' + (top ? ' top' : '') + (sec ? ' critical' : '');
     div.style.borderLeftColor = lineColor(f.lineId);
     div.innerHTML = `
       <div style="flex:1">
         <b style="color:${lineColor(f.lineId)}">${f.lineId}</b>
         <span class="mono2"> p${cfg.priority} · ${cfg.mode === 'edge' ? '边沿' : '电平'}</span>
+        ${secBadge}
         <div class="bar"><i style="width:${pct}%;background:${lineColor(f.lineId)}"></i></div>
       </div>
       <div class="mono2" style="white-space:nowrap">${f.elapsed}/${f.total} tick</div>`;
@@ -281,12 +340,31 @@ function renderTimeline(): void {
         const top = r.stack[r.stack.length - 1];
         const isTop = top && top.lineId === line.id;
         const pend = r.pending.find((p) => p.lineId === line.id);
+        // 与裁决同源：该帧下一拍是否处在自身某个临界区间内。
+        const frame = r.stack.find((f) => f.lineId === line.id);
+        const inSection =
+          frame &&
+          [...(line.criticalSections ?? [])].some(
+            (s) => s.startTick <= frame.elapsed + 1 && frame.elapsed + 1 <= s.endTick
+          );
+        const blockedByGate = r.arbitration.blocked.find((b) => b.lineId === line.id && b.reason === 'critical-gate');
         if (onStack) {
           bg = isTop
             ? `background:${color}55;box-shadow:inset 0 0 0 1px ${color}`
             : `background:${color}22`;
           content = isTop ? '▶' : '∥';
           title = isTop ? '正在执行' : '被抢占挂起';
+          if (inSection) {
+            const sec = [...(line.criticalSections ?? [])].sort((a, b) => a.startTick - b.startTick)
+              .find((s) => s.startTick <= frame!.elapsed + 1 && frame!.elapsed + 1 <= s.endTick)!;
+            content += '🔒';
+            title += `；临界区间生效（门槛 ${sec.priorityFloor}，按实际执行拍 ${frame!.elapsed + 1}）`;
+            if (isTop) bg = `background:${color}66;box-shadow:inset 0 0 0 2px var(--gate)`;
+          }
+        } else if (blockedByGate) {
+          content = '⛔';
+          title = `被临界门槛挡下：p${blockedByGate.priority} 不严格高于门槛 ${blockedByGate.priorityFloor}（待处理位保留）`;
+          bg = 'background:var(--gate-bg)';
         } else if (pend) {
           content = `P${pend.hits > 1 ? pend.hits : ''}`;
           title = `待处理 since t${pend.since}，合并 ${pend.hits} 次`;
@@ -321,7 +399,7 @@ function renderTable(): void {
     els.viewTable.innerHTML = '<p class="hint">载入配置后显示逐 tick 记录。</p>';
     return;
   }
-  let html = '<table class="records"><tr><th>tick</th><th>事件(阶段A)</th><th>完成(阶段B)</th><th>动作(阶段C/D)</th><th>执行栈（底→顶）</th><th>待处理证据</th></tr>';
+  let html = '<table class="records"><tr><th>tick</th><th>事件(阶段A)</th><th>完成(阶段B)</th><th>动作(阶段C/D)</th><th>临界门槛/阻挡(阶段C)</th><th>执行栈（底→顶）</th><th>待处理证据</th></tr>';
   for (const r of controller.ticks) {
     const evs = r.eventsApplied.length
       ? r.eventsApplied
@@ -344,11 +422,38 @@ function renderTable(): void {
     else if (r.action.type === 'continue')
       actionDesc = `<span class="tag continue">执行</span> ${r.action.lineId}（剩余 ${r.topRemaining}）`;
     else actionDesc = '<span class="tag idle">空闲</span>';
+    // 门槛/阻挡列与状态卡、时间轴、日志引用同一个 r.arbitration。
+    const arb = r.arbitration;
+    let gateDesc: string;
+    if (arb.priorityFloor !== null) {
+      gateDesc = `<span class="tag gate">门槛${arb.priorityFloor}@${arb.floorSourceLineId}</span>`;
+    } else {
+      gateDesc = '<span class="mono2">无</span>';
+    }
+    if (arb.blocked.length) {
+      gateDesc +=
+        '<div class="blocklist">' +
+        arb.blocked
+          .map((b) => {
+            const cls = b.reason === 'critical-gate' ? 'block-gate' : 'block-other';
+            return `<span class="pill ${cls}" style="border-color:${lineColor(b.lineId)}" title="${reasonZh(b.reason)}">⛔${b.lineId}${
+              b.reason === 'critical-gate' ? `≤${b.priorityFloor}` : ''
+            }</span>`;
+          })
+          .join(' ') +
+        '</div>';
+    }
     const stack = r.stack.length
       ? r.stack
           .map((f) => {
             const top = f === r.stack[r.stack.length - 1];
-            return `<span style="color:${lineColor(f.lineId)}">${top ? '▶' : '∥'}${f.lineId}(${f.elapsed}/${f.total})</span>`;
+            const cfg = config!.lines.find((l) => l.id === f.lineId)!;
+            const inSec = [...(cfg.criticalSections ?? [])].some(
+              (s) => s.startTick <= f.elapsed + 1 && f.elapsed + 1 <= s.endTick
+            );
+            return `<span style="color:${lineColor(f.lineId)}">${top ? '▶' : '∥'}${f.lineId}(${f.elapsed}/${f.total})${
+              inSec ? '🔒' : ''
+            }</span>`;
           })
           .join(' ← ')
       : '<span class="mono2">∅</span>';
@@ -358,7 +463,7 @@ function renderTable(): void {
           .join(' ')
       : '<span class="mono2">∅</span>';
     html += `<tr class="${selectedTick === r.tick ? 'hl' : ''}" data-tick="${r.tick}">
-      <td>${r.tick}</td><td>${evs}</td><td>${comp}</td><td>${actionDesc}</td><td>${stack}</td><td>${pend}</td></tr>`;
+      <td>${r.tick}</td><td>${evs}</td><td>${comp}</td><td>${actionDesc}</td><td>${gateDesc}</td><td>${stack}</td><td>${pend}</td></tr>`;
   }
   html += '</table>';
   els.viewTable.innerHTML = html;
@@ -405,7 +510,7 @@ function eventZh(k: ScheduledEvent['kind']): string {
 }
 function logZh(t: string): string {
   return (
-    { enter: '进入', preempt: '抢占', resume: '恢复', continue: '执行', complete: '完成', event: '事件', idle: '空闲' } as Record<
+    { enter: '进入', preempt: '抢占', resume: '恢复', continue: '执行', complete: '完成', block: '阻挡', event: '事件', idle: '空闲' } as Record<
       string,
       string
     >

@@ -15,6 +15,23 @@ export type EventKind =
   | 'setPriority' // 在阶段 A 调整该线后续调度的优先级
   | 'setMode'; // 在阶段 A 切换触发模式
 
+/**
+ * 临界执行区间：设备处理程序写共享寄存器期间的不可抢占窗口。
+ * 区间按该处理程序「已经实际执行的拍数」计数（1 起算，含端点），
+ * 处理程序被抢占而挂起的拍不前进 —— 因此区间随帧挂起而冻结、随恢复而继续。
+ */
+export interface CriticalSection {
+  /** 区间起点（含）：该处理程序实际执行的第 startTick 拍，>= 1。 */
+  startTick: number;
+  /** 区间终点（含）：须满足 startTick <= endTick <= handlerTicks。 */
+  endTick: number;
+  /**
+   * 整数优先级门槛：区间生效期间，待处理线只有优先级「严格高于」该门槛，
+   * 同时严格高于当前栈顶，才允许抢占（真正紧急的中断仍可进入）。
+   */
+  priorityFloor: number;
+}
+
 /** 一条中断线的静态配置。 */
 export interface LineConfig {
   /** 唯一 ID（非空字符串，全部线之间不可重复）。 */
@@ -27,6 +44,11 @@ export interface LineConfig {
   handlerTicks: number;
   /** 初始是否处于屏蔽状态，默认 false。 */
   initiallyMasked?: boolean;
+  /**
+   * 临界执行区间配置（可选）。同一条线内各区间必须互不重叠
+   * （允许相邻）；未配置时该线处理程序全程可被严格更高优先级抢占。
+   */
+  criticalSections?: CriticalSection[];
 }
 
 /** 外部事件：在 tick 等于 at 的时刻（阶段 A）按列表顺序应用。 */
@@ -61,18 +83,63 @@ export interface FrameInfo {
   preempted: boolean;
 }
 
+/**
+ * 单个待处理线未被准许抢占/调度时保留的阻挡证据。
+ * 模型、模拟器、时间轴、逐拍表格与日志共用同一组原因。
+ */
+export type BlockedReason =
+  | 'critical-gate' // 严格高于栈顶，但不严格高于当前临界门槛 → 被临界区间阻挡
+  | 'below-top' // 优先级不严格高于当前栈顶
+  | 'queue'; // 与获准候选同优先级，按 since/ID 排序后落选
+
+export interface BlockedInfo {
+  lineId: string;
+  /** 阶段 A 之后该线的当前优先级（setPriority 当拍参与裁决）。 */
+  priority: number;
+  reason: BlockedReason;
+  /** reason === 'critical-gate' 时：实际生效的门槛值。 */
+  priorityFloor?: number;
+  /** reason === 'critical-gate' 时：贡献该门槛的帧所属线（栈中可能是多层嵌套）。 */
+  floorSourceLineId?: string;
+}
+
+/** 阶段 C 调度裁决证据（同一有效门槛同时供时间轴、表格与日志引用）。 */
+export interface ArbitrationInfo {
+  /** 裁决前栈顶线（栈空时为 null）。 */
+  topLineId: string | null;
+  /** 裁决前栈顶的当前优先级（栈空时为 null）。 */
+  topPriority: number | null;
+  /**
+   * 当前有效门槛：执行栈中所有「已开始未结束」的临界区间的最高 priorityFloor；
+   * 栈空或没有任何生效区间时为 null。
+   */
+  priorityFloor: number | null;
+  /** 贡献该最高门槛的帧（帧所属线；栈中多层时取最大值）。 */
+  floorSourceLineId: string | null;
+  /** 裁决时所有仍生效的临界区间（按栈帧自底向上），用于时间轴标注。 */
+  activeSections: Array<{ frameLineId: string; startTick: number; endTick: number; priorityFloor: number }>;
+  /**
+   * 未获准的可运行待处理线（未屏蔽、未在栈中），保持调度顺序
+   * （优先级降序，再按 since、ID）；其待处理位与排序证据原样保留。
+   */
+  blocked: BlockedInfo[];
+}
+
 /** 单条执行日志（时间轴与表格共用同一条轨迹）。 */
 export interface TraceLog {
   tick: number;
   /**
    * enter：处理程序进入；preempt：当前程序被更高优先级线抢占；
    * resume：被抢占帧在抢占者完成后恢复执行；continue：帧正常继续执行；
-   * complete：处理完成；event：外部事件被应用。
+   * complete：处理完成；block：待处理线被当前有效门槛/栈顶挡下；
+   * event：外部事件被应用。
    */
-  type: 'enter' | 'preempt' | 'resume' | 'continue' | 'complete' | 'event';
+  type: 'enter' | 'preempt' | 'resume' | 'continue' | 'complete' | 'block' | 'event';
   lineId?: string;
   /** 关联事件（type === 'event' 时）。 */
   eventKind?: EventKind;
+  /** 阻挡时的有效门槛（type === 'block' / 'preempt' 时，可能为 null）。 */
+  priorityFloor?: number | null;
   detail: string;
 }
 
@@ -100,6 +167,12 @@ export interface TickRecord {
   masked: string[];
   /** 本 tick 结束后栈顶帧剩余 tick（空闲时为 null）。 */
   topRemaining: number | null;
+  /**
+   * 阶段 C 的调度裁决（在应用当拍事件、上一拍完成之后，执行之前计算）：
+   * 记录当前有效临界门槛、其来源与每个未获准待处理线的阻挡原因。
+   * 时间轴 / 表格 / 日志均引用这里的同一份门槛与原因。
+   */
+  arbitration: ArbitrationInfo;
 }
 
 /** 一次完整回放的产物。 */

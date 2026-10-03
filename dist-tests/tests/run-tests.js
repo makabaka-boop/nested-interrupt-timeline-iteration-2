@@ -266,6 +266,170 @@ describe('调级：调到相同优先级仍不抢占（严格更高门槛）', (
     eq(actions(trace), ['enter:A', 'cont:A', 'cont:A', 'enter:B', 'idle'], 'A 调到与 B 相同的 2：同优先级不抢占，A 跑完后 B 才进入');
 });
 // ---------------------------------------------------------------------------
+// 场景 11：临界门槛阻挡普通高优先级，真正紧急的中断仍可进入，区间结束放行
+// ---------------------------------------------------------------------------
+describe('临界区间：A 第2..4拍门槛5 —— B(p4)被挡、C(p6)可入、区间后 B 才抢占', () => {
+    const lines = [
+        { id: 'A', priority: 2, mode: 'edge', handlerTicks: 5, criticalSections: [{ startTick: 2, endTick: 4, priorityFloor: 5 }] },
+        { id: 'B', priority: 4, mode: 'edge', handlerTicks: 1 },
+        { id: 'C', priority: 6, mode: 'edge', handlerTicks: 1 },
+    ];
+    const events = [
+        { at: 1, lineId: 'A', kind: 'raise' },
+        { at: 2, lineId: 'B', kind: 'raise' },
+        { at: 3, lineId: 'C', kind: 'raise' },
+    ];
+    const trace = runReplay(lines, events);
+    eq(actions(trace), ['enter:A', 'cont:A', 'preempt:C>A', 'resume:A', 'cont:A', 'preempt:B>A', 'resume:A', 'idle'], 'B 在 t2/t4/t5 被门槛挡下并保留待处理位；C t3 进入；t6 区间已结束 B 才抢占');
+    eq(completes(trace), [[4, 'C'], [7, 'B'], [8, 'A']], 'C、B、A 依次完成');
+    // t2：区间生效（下一执行拍=2），门槛5，B 被挡，待处理位保留。
+    const arb2 = trace.ticks[1].arbitration;
+    eq(arb2.priorityFloor, 5, 't2 有效门槛为 5');
+    eq(arb2.floorSourceLineId, 'A', '门槛来自 A 的临界区间');
+    eq(arb2.blocked, [{ lineId: 'B', priority: 4, reason: 'critical-gate', priorityFloor: 5, floorSourceLineId: 'A' }], 't2：B 严格高于栈顶但不严格高于门槛 → critical-gate');
+    eq(trace.ticks[1].pending.find((p) => p.lineId === 'B')?.since, 2, 'B 的待处理位与 since 证据原样保留');
+    // t4：C 已完成，A 恢复，区间仍生效（挂起期间 elapsed 冻结在 2），B 继续被挡。
+    eq(trace.ticks[3].arbitration.priorityFloor, 5, 't4 A 恢复时区间继续生效（挂起不前进）');
+    eq(trace.ticks[4].arbitration.priorityFloor, 5, 't5 区间最后一拍门槛仍在');
+    eq(trace.ticks[5].arbitration.priorityFloor, null, 't6 下一执行拍=5，区间结束 → 无门槛，B 获准');
+    const blockLogs = trace.logs.filter((l) => l.type === 'block');
+    ok(blockLogs.length >= 3 && blockLogs.every((l) => l.priorityFloor === 5), '日志记录每次阻挡且门槛与裁决一致（5）');
+});
+// ---------------------------------------------------------------------------
+// 场景 11b：单拍区间边界
+// ---------------------------------------------------------------------------
+describe('临界区间边界：仅第 2 拍有门槛10，前后拍均可抢占', () => {
+    const lines = [
+        { id: 'D', priority: 1, mode: 'edge', handlerTicks: 3, criticalSections: [{ startTick: 2, endTick: 2, priorityFloor: 10 }] },
+        { id: 'X', priority: 5, mode: 'edge', handlerTicks: 1 },
+    ];
+    const events = [
+        { at: 1, lineId: 'D', kind: 'raise' },
+        { at: 2, lineId: 'X', kind: 'raise' },
+    ];
+    const trace = runReplay(lines, events);
+    eq(trace.ticks[0].arbitration.priorityFloor, null, 't1 下一执行拍=1，区间未开始');
+    eq(trace.ticks[1].arbitration.priorityFloor, 10, 't2 下一执行拍=2，单拍区间生效，X(p5) 被挡');
+    eq(actions(trace), ['enter:D', 'cont:D', 'preempt:X>D', 'resume:D', 'idle'], 't3 区间已过，X 抢占');
+});
+// ---------------------------------------------------------------------------
+// 场景 11c：嵌套 —— 门槛取全栈生效区间的最高值；挂起外层区间冻结
+// ---------------------------------------------------------------------------
+describe('嵌套临界：B 区间门槛6 高于挂起中 A 的门槛3，C(p5) 被 B 挡；D(p7) 可入', () => {
+    const lines = [
+        { id: 'A', priority: 1, mode: 'edge', handlerTicks: 8, criticalSections: [{ startTick: 2, endTick: 7, priorityFloor: 3 }] },
+        { id: 'B', priority: 4, mode: 'edge', handlerTicks: 3, criticalSections: [{ startTick: 2, endTick: 2, priorityFloor: 6 }] },
+        { id: 'C', priority: 5, mode: 'edge', handlerTicks: 1 },
+        { id: 'Hi', priority: 7, mode: 'edge', handlerTicks: 1 },
+    ];
+    const events = [
+        { at: 1, lineId: 'A', kind: 'raise' },
+        { at: 2, lineId: 'B', kind: 'raise' },
+        { at: 3, lineId: 'C', kind: 'raise' },
+        { at: 4, lineId: 'Hi', kind: 'raise' },
+    ];
+    const trace = runReplay(lines, events);
+    // t2：A 的门槛3 不挡 B(p4)，B 抢占 A。
+    eq(trace.ticks[1].action, { type: 'preempt', by: 'B', resumed: 'A' }, 't2 B(p4) 严格高于 A 门槛3，可抢占');
+    // t3：栈为 A(frozen elapsed1, 区间3) + B(下一执行拍2, 区间6)，取最高6。
+    const arb3 = trace.ticks[2].arbitration;
+    eq(arb3.activeSections.map((s) => s.frameLineId).sort(), ['A', 'B'], 't3 A、B 两帧区间同时生效');
+    eq(arb3.priorityFloor, 6, 't3 有效门槛取全栈最高 = 6（B）');
+    eq(arb3.floorSourceLineId, 'B', '最高门槛来源为内层 B');
+    eq(arb3.blocked.find((b) => b.lineId === 'C'), { lineId: 'C', priority: 5, reason: 'critical-gate', priorityFloor: 6, floorSourceLineId: 'B' }, 'C(p5) 严格高于栈顶 B(p4) 但不高于门槛6 → 被挡');
+    // t4：B 区间结束（下一执行拍3），仅剩 A 的门槛3，Hi(p7) 可抢占。
+    eq(trace.ticks[3].arbitration.priorityFloor, 3, 't4 B 区间退出，门槛回落为 A 的 3');
+    eq(trace.ticks[3].action, { type: 'preempt', by: 'Hi', resumed: 'B' }, 't4 Hi(p7) 进入');
+});
+// ---------------------------------------------------------------------------
+// 场景 11d：电平重入 —— 临界区间计数随新帧重置
+// ---------------------------------------------------------------------------
+describe('电平重入：每次调用的临界区间从第 1 拍重新计数', () => {
+    const lines = [
+        { id: 'L', priority: 1, mode: 'level', handlerTicks: 2, criticalSections: [{ startTick: 2, endTick: 2, priorityFloor: 5 }] },
+        { id: 'U', priority: 3, mode: 'edge', handlerTicks: 1 },
+    ];
+    const events = [
+        { at: 1, lineId: 'L', kind: 'raise' },
+        { at: 2, lineId: 'U', kind: 'raise' },
+    ];
+    const trace = runReplay(lines, events);
+    eq(trace.ticks[1].arbitration.priorityFloor, 5, 't2 第一次调用第 2 拍：门槛5 挡住 U(p3)');
+    // 第二次进入的帧 enteredAt=4；t5 是其第 2 拍，区间重新生效。
+    const t5 = trace.ticks[4];
+    const lFrame = t5.stack.find((f) => f.lineId === 'L');
+    eq(lFrame.enteredAt, 4, 'L 完成后经 U 让出，第二次帧于 t4 重新进入');
+    eq(t5.arbitration.priorityFloor, 5, 't5 第二次调用的第 2 拍区间重新生效（计数随帧重置）');
+});
+// ---------------------------------------------------------------------------
+// 场景 11e：屏蔽的待处理线不是门槛阻挡；解除后才参与裁决
+// ---------------------------------------------------------------------------
+describe('临界 + 屏蔽：屏蔽线不进入阻挡证据，unmask 当拍再裁决', () => {
+    const lines = [
+        { id: 'A', priority: 1, mode: 'edge', handlerTicks: 4, criticalSections: [{ startTick: 2, endTick: 3, priorityFloor: 5 }] },
+        { id: 'M', priority: 3, mode: 'edge', handlerTicks: 1 },
+    ];
+    const events = [
+        { at: 1, lineId: 'A', kind: 'raise' },
+        { at: 2, lineId: 'M', kind: 'raise' },
+        { at: 2, lineId: 'M', kind: 'mask' },
+        { at: 4, lineId: 'M', kind: 'unmask' },
+    ];
+    const trace = runReplay(lines, events);
+    ok(!trace.ticks[2].arbitration.blocked.some((b) => b.lineId === 'M'), 't3 M 屏蔽中：不是门槛阻挡，不进 blocked');
+    ok(trace.ticks[2].pending.some((p) => p.lineId === 'M'), '边沿待处理位在屏蔽期间保留');
+    eq(trace.ticks[3].action, { type: 'preempt', by: 'M', resumed: 'A' }, 't4 解除屏蔽且区间已结束，M 当拍抢占');
+});
+// ---------------------------------------------------------------------------
+// 场景 11f：setPriority 当拍参与门槛裁决；被挡期间边沿合并
+// ---------------------------------------------------------------------------
+describe('临界 + 调级/合并：W 调到6当拍越过门槛5；E 被挡期间合并保留 since', () => {
+    const lines = [
+        { id: 'A', priority: 1, mode: 'edge', handlerTicks: 4, criticalSections: [{ startTick: 2, endTick: 3, priorityFloor: 5 }] },
+        { id: 'W', priority: 4, mode: 'edge', handlerTicks: 1 },
+        { id: 'E', priority: 5, mode: 'edge', handlerTicks: 1 },
+    ];
+    const events = [
+        { at: 1, lineId: 'A', kind: 'raise' },
+        { at: 2, lineId: 'W', kind: 'raise' },
+        { at: 2, lineId: 'E', kind: 'raise' },
+        { at: 3, lineId: 'E', kind: 'raise' },
+        { at: 3, lineId: 'W', kind: 'setPriority', priority: 6 },
+    ];
+    const trace = runReplay(lines, events);
+    // t2：门槛5，W(p4) 被挡，E(p5) 严格高于但需 >5，5 不 > 5 → 也被挡。
+    eq(trace.ticks[1].arbitration.blocked.map((b) => [b.lineId, b.reason]).sort(), [['E', 'critical-gate'], ['W', 'critical-gate']], 't2 W(p4)、E(p5) 均不严格高于门槛 5');
+    // t3：E 重复触发合并（since 仍为 2，hits=2）；W 阶段 A 调到 6，当拍越过门槛抢占。
+    const ePend = trace.ticks[2].pending.find((p) => p.lineId === 'E');
+    eq([ePend.since, ePend.hits], [2, 2], 'E 被挡期间再次触发合并为 1 位，since 不变');
+    eq(trace.ticks[2].action, { type: 'preempt', by: 'W', resumed: 'A' }, 't3 setPriority 当拍参与裁决，W(p6) 获准');
+});
+// ---------------------------------------------------------------------------
+// 场景 11g：阻挡原因三分类
+// ---------------------------------------------------------------------------
+describe('阻挡原因：below-top / critical-gate / queue 各归其类', () => {
+    const lines = [
+        { id: 'A', priority: 2, mode: 'edge', handlerTicks: 5, criticalSections: [{ startTick: 2, endTick: 4, priorityFloor: 5 }] },
+        { id: 'Lo', priority: 1, mode: 'edge', handlerTicks: 1 },
+        { id: 'Hi', priority: 4, mode: 'edge', handlerTicks: 1 },
+        { id: 'Z1', priority: 8, mode: 'edge', handlerTicks: 1 },
+        { id: 'Z2', priority: 8, mode: 'edge', handlerTicks: 1 },
+    ];
+    const events = [
+        { at: 1, lineId: 'A', kind: 'raise' },
+        { at: 2, lineId: 'Lo', kind: 'raise' },
+        { at: 2, lineId: 'Hi', kind: 'raise' },
+        { at: 2, lineId: 'Z2', kind: 'raise' },
+        { at: 2, lineId: 'Z1', kind: 'raise' },
+    ];
+    const trace = runReplay(lines, events);
+    eq(trace.ticks[1].arbitration.blocked, [
+        { lineId: 'Z2', priority: 8, reason: 'queue' },
+        { lineId: 'Hi', priority: 4, reason: 'critical-gate', priorityFloor: 5, floorSourceLineId: 'A' },
+        { lineId: 'Lo', priority: 1, reason: 'below-top' },
+    ], 'Z2 同优先级排序落选(queue)；Hi 被门槛挡；Lo 低于栈顶');
+});
+// ---------------------------------------------------------------------------
 // 交叉核对：不同批次推进 vs 参考状态机（逐 tick）
 // ---------------------------------------------------------------------------
 function normalize(rec) {
@@ -285,6 +449,8 @@ function normalize(rec) {
         levelAsserted: rec.levelAsserted,
         masked: rec.masked,
         topRemaining: rec.topRemaining,
+        // 门槛与阻挡原因同样逐拍对齐（模型/时间轴/日志共用的那份裁决）。
+        arbitration: rec.arbitration,
     });
 }
 function crossCheck(name, lines, events) {
@@ -365,6 +531,41 @@ describe('不同批次推进 ↔ 逐 tick 参考状态机（固定场景）', ()
         { at: 6, lineId: 'L', kind: 'setMode', mode: 'level' },
         { at: 7, lineId: 'L', kind: 'raise' },
     ]);
+    crossCheck('临界区间：多段 + 嵌套 + 电平重入', [
+        {
+            id: 'A',
+            priority: 2,
+            mode: 'edge',
+            handlerTicks: 6,
+            criticalSections: [
+                { startTick: 2, endTick: 3, priorityFloor: 4 },
+                { startTick: 5, endTick: 6, priorityFloor: 2 },
+            ],
+        },
+        { id: 'B', priority: 3, mode: 'edge', handlerTicks: 2, criticalSections: [{ startTick: 1, endTick: 2, priorityFloor: 6 }] },
+        { id: 'C', priority: 5, mode: 'edge', handlerTicks: 1 },
+        { id: 'L', priority: 1, mode: 'level', handlerTicks: 3, criticalSections: [{ startTick: 2, endTick: 2, priorityFloor: 3 }] },
+    ], [
+        { at: 1, lineId: 'A', kind: 'raise' },
+        { at: 1, lineId: 'L', kind: 'raise' },
+        { at: 2, lineId: 'B', kind: 'raise' },
+        { at: 3, lineId: 'C', kind: 'raise' },
+        { at: 4, lineId: 'C', kind: 'raise' },
+        { at: 6, lineId: 'L', kind: 'lower' },
+    ]);
+    crossCheck('临界 + 调级/屏蔽/切模式混合', [
+        { id: 'A', priority: 3, mode: 'edge', handlerTicks: 5, criticalSections: [{ startTick: 1, endTick: 4, priorityFloor: 4 }] },
+        { id: 'W', priority: 2, mode: 'edge', handlerTicks: 2, initiallyMasked: true },
+        { id: 'V', priority: 5, mode: 'level', handlerTicks: 2, criticalSections: [{ startTick: 1, endTick: 1, priorityFloor: 7 }] },
+    ], [
+        { at: 1, lineId: 'A', kind: 'raise' },
+        { at: 2, lineId: 'W', kind: 'raise' },
+        { at: 3, lineId: 'A', kind: 'setPriority', priority: 1 },
+        { at: 3, lineId: 'W', kind: 'unmask' },
+        { at: 4, lineId: 'V', kind: 'raise' },
+        { at: 5, lineId: 'V', kind: 'lower' },
+        { at: 6, lineId: 'A', kind: 'setMode', mode: 'level' },
+    ]);
 });
 // ---------------------------------------------------------------------------
 // 模糊测试：确定性 PRNG，参考机核对 200 个随机场景
@@ -386,13 +587,32 @@ describe('模糊测试：200 个随机场景，逐状态对齐参考机', () => 
     for (let it = 0; it < 200; it++) {
         const n = 1 + Math.floor(rand() * 8);
         const ids = Array.from({ length: n }, (_, i) => 'L' + i);
-        const lines = ids.map((id) => ({
-            id,
-            priority: 1 + Math.floor(rand() * 4),
-            mode: rand() < 0.5 ? 'edge' : 'level',
-            handlerTicks: 1 + Math.floor(rand() * 4),
-            initiallyMasked: rand() < 0.15,
-        }));
+        const lines = ids.map((id) => {
+            const handlerTicks = 1 + Math.floor(rand() * 4);
+            // 约 40% 的线带若干互不重叠（允许相邻）的临界区间：在 handlerTicks 拍轴上
+            // 从随机切点之间挑段落，门槛取 1..6。
+            let criticalSections;
+            if (rand() < 0.4) {
+                const cuts = [0, ...Array.from({ length: 2 }, () => 1 + Math.floor(rand() * (handlerTicks - 1 || 1))).sort((a, b) => a - b), handlerTicks];
+                const secs = [];
+                for (let k = 1; k < cuts.length; k++) {
+                    const s = cuts[k - 1] + 1;
+                    const e = cuts[k];
+                    if (s <= e && rand() < 0.6)
+                        secs.push({ startTick: s, endTick: e, priorityFloor: 1 + Math.floor(rand() * 6) });
+                }
+                if (secs.length)
+                    criticalSections = secs;
+            }
+            return {
+                id,
+                priority: 1 + Math.floor(rand() * 4),
+                mode: rand() < 0.5 ? 'edge' : 'level',
+                handlerTicks,
+                initiallyMasked: rand() < 0.15,
+                ...(criticalSections ? { criticalSections } : {}),
+            };
+        });
         const evCount = Math.floor(rand() * 24);
         const events = Array.from({ length: evCount }, () => {
             const kind = kinds[Math.floor(rand() * kinds.length)];
@@ -450,6 +670,18 @@ describe('配置校验：1～8 线、唯一 ID、handlerTicks >= 1、越界事�
     ok(validateInput([{ id: 'E', priority: 1, mode: 'edge', handlerTicks: 1 }], [
         { at: 501, lineId: 'E', kind: 'raise' },
     ]).warnings.length === 1, 'tick>500 的事件产生告警');
+    ok(validateInput([{ id: 'G', priority: 1, mode: 'edge', handlerTicks: 4, criticalSections: [{ startTick: 2, endTick: 5, priorityFloor: 3 }] }], []).errors.length >= 1, '临界区间终点超出 handlerTicks 被拒绝');
+    ok(validateInput([{ id: 'G', priority: 1, mode: 'edge', handlerTicks: 4, criticalSections: [
+                { startTick: 2, endTick: 3, priorityFloor: 3 },
+                { startTick: 3, endTick: 4, priorityFloor: 2 },
+            ] }], []).errors.length >= 1, '重叠临界区间被拒绝（相邻允许）');
+    ok(validateInput([{ id: 'G', priority: 1, mode: 'edge', handlerTicks: 4, criticalSections: [
+                { startTick: 2, endTick: 1, priorityFloor: 3 },
+            ] }], []).errors.length >= 1, 'startTick > endTick 被拒绝');
+    ok(validateInput([{ id: 'G', priority: 1, mode: 'edge', handlerTicks: 4, criticalSections: [
+                { startTick: 1, endTick: 2, priorityFloor: 3 },
+                { startTick: 3, endTick: 4, priorityFloor: 2 },
+            ] }], []).errors.length === 0, '相邻不重叠区间合法');
 });
 // ---------------------------------------------------------------------------
 console.log(`\n${passed} passed, ${failed} failed`);

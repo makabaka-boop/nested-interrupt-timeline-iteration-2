@@ -9,7 +9,7 @@
   <body>
     <header>
       <h1>中断控制器回放</h1>
-      <span class="sub">纯模拟 · 1～8 条中断线 · 边沿/电平 · 嵌套抢占 · 至多 500 tick</span>
+      <span class="sub">纯模拟 · 1～8 条中断线 · 边沿/电平 · 嵌套抢占 · 临界执行区间门槛 · 至多 500 tick</span>
     </header>
 
     <div class="layout">
@@ -21,10 +21,10 @@
           <select id="demo"></select>
           <p class="desc" id="desc"></p>
 
-          <label>中断线（JSON 数组：id / priority / mode=edge|level / handlerTicks / initiallyMasked?）</label>
+          <label>中断线（JSON 数组：id / priority / mode=edge|level / handlerTicks / initiallyMasked? / criticalSections?）</label>
           <textarea id="linesJson" rows="9" spellcheck="false"></textarea>
 
-          <label>事件（JSON 数组：at / lineId / kind=raise|lower|mask|unmask）</label>
+          <label>事件（JSON 数组：at / lineId / kind=raise|lower|mask|unmask|setPriority|setMode）</label>
           <textarea id="eventsJson" rows="8" spellcheck="false"></textarea>
 
           <div class="btnrow">
@@ -44,7 +44,7 @@
             <button id="runAll">整批跑到静止</button>
           </div>
           <p class="hint">
-            顺序固定：每 tick 先应用事件，再处理上一 tick 的完成，然后仅更高优先级待处理线可抢占，最后栈顶执行 1 tick。
+            顺序固定：每 tick 先应用事件，再处理上一 tick 的完成，然后从执行栈所有未结束的临界区间取最高门槛——待处理线只有优先级同时严格高于栈顶与该门槛才获准抢占，最后栈顶执行 1 tick。
           </p>
         </div>
 
@@ -53,6 +53,7 @@
           <p class="desc">
             当前 tick：<b id="tickNo">0</b> ｜ 栈顶剩余：<b id="remaining">—</b>
           </p>
+          <div id="gateBox"></div>
           <div class="stackview" id="stackView"></div>
           <div class="stategrid">
             <div class="box">
@@ -82,6 +83,7 @@
             <span><i style="background:var(--continue)"></i>执行中</span>
             <span><i style="background:var(--idle)"></i>空闲</span>
             <span>▶ 栈顶执行 ｜ ∥ 被抢占挂起 ｜ ■ 完成 ｜ P 待处理（数字为合并次数）｜ ~ 电平有效</span>
+            <span>🔒 临界区间生效（按实际执行拍计数，挂起冻结）｜ ⛔ 被临界门槛挡下（待处理位保留）</span>
             <span>▲ raise ｜ ▼ lower ｜ ⛔ mask ｜ ✓ unmask</span>
           </div>
           <div class="warn" id="trunc" style="display:none"></div>
